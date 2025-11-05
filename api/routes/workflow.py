@@ -21,8 +21,9 @@ _workflow = None
 def get_workflow():
     """Get or create workflow instance"""
     global _workflow
-    if _workflow is None:
-        _workflow = create_qa_workflow()
+    # Always recreate workflow to pick up code changes (useful during development)
+    # In production, you might want to cache this: if _workflow is None:
+    _workflow = create_qa_workflow()
     return _workflow
 
 
@@ -71,6 +72,8 @@ async def run_task(request: TaskRequest):
         workflow = get_workflow()
         
         # Run workflow (async)
+        # Note: We rely on our own max_steps check in should_continue() routers
+        # LangGraph's default recursion limit (25) will be sufficient as a safety net
         result = await workflow.ainvoke(initial_state)
         
         # Return result

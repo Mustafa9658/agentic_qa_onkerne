@@ -67,7 +67,8 @@ def convert_browser_use_actions(actions: List[Dict[str, Any]]) -> List[Dict[str,
             # {"click": {"index": 6438}}
             # {"click": {"element": 6438}}
             # {"click": {"element_index": 6438}}
-            index = action_params.get("index") or action_params.get("element_index") or action_params.get("element")
+            # {"click": {"selector": 6438}} - LLM sometimes uses "selector"
+            index = action_params.get("index") or action_params.get("element_index") or action_params.get("element") or action_params.get("selector")
             if index is None:
                 logger.warning(f"No index found in click action params: {action_params}")
                 continue
@@ -77,9 +78,16 @@ def convert_browser_use_actions(actions: List[Dict[str, Any]]) -> List[Dict[str,
                 "reasoning": "Browser-use action"
             })
         elif action_type == "input_text" or action_type == "input":
+            # Input can have index, element_index, element, or id (browser-use supports id lookup)
+            # LLM sometimes uses "element" instead of "index" or "element_index"
+            index = action_params.get("index") or action_params.get("element_index") or action_params.get("element")
+            # If no index but has id, we need to find it in DOM (but for now, warn)
+            if index is None and action_params.get("id"):
+                logger.warning(f"Input action has 'id' ({action_params.get('id')}) but no index - LLM should provide index from browser_state")
+            # Default to None if no index provided (let act node handle error)
             converted.append({
                 "action": "input",  # Browser-use function name
-                "index": action_params.get("index", action_params.get("element_index", 0)),
+                "index": int(index) if index is not None else None,  # Convert to int if provided
                 "text": action_params.get("text", action_params.get("value", "")),
                 "reasoning": "Browser-use action"
             })
@@ -115,7 +123,90 @@ def convert_browser_use_actions(actions: List[Dict[str, Any]]) -> List[Dict[str,
                 "action": "scroll",
                 "down": action_params.get("down", True),
                 "pages": action_params.get("pages", 1.0),
+                "index": action_params.get("index"),  # Optional index for element-specific scrolling
                 "reasoning": "Browser-use action"
+            })
+        elif action_type == "switch_tab" or action_type == "switch":
+            # Browser-use uses "switch" as the action name
+            # LLM sometimes uses "tab" instead of "tab_id"
+            tab_id = action_params.get("tab_id") or action_params.get("tab", "")
+            # Ensure tab_id is 4 characters (last 4 of target_id)
+            if tab_id and len(tab_id) > 4:
+                tab_id = tab_id[-4:]
+            converted.append({
+                "action": "switch",  # Browser-use function name is "switch"
+                "tab_id": tab_id,
+                "reasoning": "Browser-use switch tab action"
+            })
+        elif action_type == "close_tab":
+            converted.append({
+                "action": "close_tab",
+                "tab_id": action_params.get("tab_id", ""),
+                "reasoning": "Browser-use close tab action"
+            })
+        elif action_type == "extract":
+            # Handle different extract formats from LLM
+            # LLM sometimes uses "attributes" instead of "elements"
+            query = action_params.get("query", "")
+            elements = action_params.get("elements") or action_params.get("attributes", [])
+            text = action_params.get("text", False)
+            url = action_params.get("url", False)
+            
+            # If LLM wants title/URL, these are already in browser state - convert to appropriate query
+            if elements and isinstance(elements, list):
+                if "title" in elements and "url" in elements:
+                    query = "extract the page title and URL"
+                elif "title" in elements:
+                    query = "extract the page title"
+                elif "url" in elements:
+                    query = "extract the page URL"
+                else:
+                    query = f"extract {', '.join(elements)}"
+            elif text and url:
+                query = "extract the page title and URL"
+            elif text:
+                query = "extract the page title"
+            elif url:
+                query = "extract the page URL"
+            elif not query:
+                # Default query if none provided
+                query = "extract relevant information from the page"
+            
+            converted.append({
+                "action": "extract",
+                "query": query,
+                "extract_links": action_params.get("extract_links", False) or url or (elements and "url" in elements if isinstance(elements, list) else False),
+                "start_from_char": action_params.get("start_from_char", 0),
+                "reasoning": "Browser-use extract action"
+            })
+        elif action_type == "search":
+            converted.append({
+                "action": "search",
+                "query": action_params.get("query", ""),
+                "engine": action_params.get("engine", "duckduckgo"),
+                "reasoning": "Browser-use search action"
+            })
+        elif action_type == "send_keys":
+            converted.append({
+                "action": "send_keys",
+                "keys": action_params.get("keys", ""),
+                "reasoning": "Browser-use send keys action"
+            })
+        elif action_type == "wait":
+            converted.append({
+                "action": "wait",
+                "seconds": action_params.get("seconds", 3),
+                "reasoning": "Browser-use wait action"
+            })
+        elif action_type == "screenshot":
+            converted.append({
+                "action": "screenshot",
+                "reasoning": "Browser-use screenshot action"
+            })
+        elif action_type == "go_back":
+            converted.append({
+                "action": "go_back",
+                "reasoning": "Browser-use go back action"
             })
         else:
             logger.warning(f"Unknown browser-use action type: {action_type}, skipping")
@@ -146,9 +237,17 @@ def parse_llm_action_plan(response_content: str) -> List[Dict[str, Any]]:
         logger.warning("Empty LLM response")
         return []
 
-    # Strategy 1: Try direct JSON parsing
+    # Strategy 1: Strip JSON comments before parsing (JSON doesn't support comments)
+    # Remove single-line comments (// ...) and multi-line comments (/* ... */)
+    cleaned_content = response_content.strip()
+    # Remove single-line comments
+    cleaned_content = re.sub(r'//.*?$', '', cleaned_content, flags=re.MULTILINE)
+    # Remove multi-line comments
+    cleaned_content = re.sub(r'/\*.*?\*/', '', cleaned_content, flags=re.DOTALL)
+    
+    # Strategy 1: Try direct JSON parsing (on cleaned content)
     try:
-        parsed = json.loads(response_content.strip())
+        parsed = json.loads(cleaned_content)
 
         # Browser-use format: {"thinking": "...", "action": [actions]}
         if isinstance(parsed, dict) and "action" in parsed:
@@ -176,7 +275,11 @@ def parse_llm_action_plan(response_content: str) -> List[Dict[str, Any]]:
     matches = re.findall(json_pattern, response_content, re.DOTALL)
     if matches:
         try:
-            parsed = json.loads(matches[0])
+            # Strip comments from extracted JSON
+            json_str = matches[0]
+            json_str = re.sub(r'//.*?$', '', json_str, flags=re.MULTILINE)
+            json_str = re.sub(r'/\*.*?\*/', '', json_str, flags=re.DOTALL)
+            parsed = json.loads(json_str)
 
             # Browser-use format in markdown
             if isinstance(parsed, dict) and "action" in parsed:
@@ -270,7 +373,7 @@ def validate_action(action: Dict[str, Any]) -> bool:
     # Valid browser-use action types (using actual function names from browser-use)
     VALID_ACTIONS = {
         "click", "input", "navigate", "scroll", "done", "search", "extract",
-        "send_keys", "switch_tab", "close_tab", "wait", "screenshot",
+        "send_keys", "switch", "switch_tab", "close_tab", "wait", "screenshot", "go_back",
         # Legacy names for backward compatibility (will be converted)
         "go_to_url", "click_element", "input_text", "hover"
     }
