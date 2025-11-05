@@ -54,3 +54,6 @@ Thumbs.db
 *.db
 *.sqlite
 
+# Documentation/Summary files
+ISSUES_SUMMARY.md
+

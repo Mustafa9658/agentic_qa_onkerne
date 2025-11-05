@@ -212,7 +212,7 @@ class SessionManager:
 					)
 				else:
 					await self.browser_session._cdp_client_root.send.Runtime.runIfWaitingForDebugger(session_id=session_id)
-					self.logger.debug(f'[SessionManager] Resumed execution for session {session_id[:8]}...')
+					self.logger.debug(f'[SessionManager] Resumed execution for session {session_id[:8]}...')																																																																																																				
 			except Exception as e:
 				self.logger.warning(f'[SessionManager] Failed to resume execution: {e}')
 

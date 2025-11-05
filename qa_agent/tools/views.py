@@ -78,6 +78,10 @@ class SendKeysAction(BaseModel):
 	keys: str = Field(description='keys (Escape, Enter, PageDown) or shortcuts (Control+o)')
 
 
+class WaitAction(BaseModel):
+	seconds: int = Field(default=3, description='Number of seconds to wait (max 30)')
+
+
 class UploadFileAction(BaseModel):
 	index: int
 	path: str
