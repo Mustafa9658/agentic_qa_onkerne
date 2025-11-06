@@ -1,0 +1,154 @@
+"""
+PLAN Node - Browser-use todo.md pattern (pure LLM-driven)
+
+This node does MINIMAL work - it just passes through and lets the LLM naturally
+create todo.md on its first step. This follows browser-use's design philosophy:
+
+System prompt already says:
+"If todo.md is empty and the task is multi-step, generate a stepwise plan in todo.md using file tools."
+
+The LLM will:
+1. See the task in <user_request>
+2. See empty todo.md in <todo_contents>
+3. Recognize it's multi-step
+4. Call write_file to create todo.md with checkboxes
+5. Mark items complete as it progresses
+
+We only add lightweight goal tracking for PAGE STATE detection to prevent loops.
+"""
+import logging
+from typing import Dict, Any
+from qa_agent.state import QAAgentState
+from qa_agent.llm import get_llm
+from langchain_core.messages import SystemMessage, HumanMessage
+
+logger = logging.getLogger(__name__)
+
+
+async def plan_node(state: QAAgentState) -> Dict[str, Any]:
+	"""
+	Plan node: Lightweight goal extraction for loop prevention
+
+	This node does TWO things:
+	1. Let LLM manage todo.md naturally (browser-use pattern)
+	2. Extract high-level goals for PAGE STATE-based completion detection
+
+	The goals are ONLY used to detect "we're on dashboard now, signup must be done"
+	to prevent repeating completed steps.
+
+	Args:
+		state: Current QA agent state
+
+	Returns:
+		Updated state with lightweight goals for page state detection
+	"""
+	try:
+		task = state.get("task", "")
+
+		logger.info(f"PLAN: Analyzing task for goal extraction...")
+
+		# Simple heuristic: Check if task is complex enough
+		task_lower = task.lower()
+		sequencing_words = ["then", "after", "next", "once", "when", "wait"]
+		has_sequencing = any(word in task_lower for word in sequencing_words)
+		is_long_task = len(task) > 400
+
+		if not (has_sequencing or is_long_task):
+			logger.info("PLAN: Simple task, no goal tracking needed")
+			logger.info("PLAN: LLM will handle via todo.md if needed")
+			return {
+				"goals": [],
+				"completed_goals": [],
+				"current_goal_index": 0,
+			}
+
+		# Complex task - extract lightweight goals for PAGE STATE detection
+		logger.info("PLAN: Complex task, extracting goals for page state tracking...")
+
+		llm = get_llm()
+
+		# Lightweight planning prompt - just extract major phases
+		planning_prompt = f"""Extract high-level phases from this QA task for progress tracking.
+
+**Task:**
+{task}
+
+**Goal:**
+Identify 2-5 major phases that can be detected by page state changes (URL/title changes).
+
+**Output JSON:**
+```json
+{{
+  "goals": [
+    {{
+      "id": "short_id",
+      "description": "Brief description",
+      "completion_signals": ["keyword_in_url_or_title"]
+    }}
+  ]
+}}
+```
+
+**Example:**
+For "Sign up, then login, then add item":
+```json
+{{
+  "goals": [
+    {{"id": "signup", "description": "Complete signup", "completion_signals": ["dashboard", "logged in"]}},
+    {{"id": "login", "description": "Log in", "completion_signals": ["dashboard", "my dashboard"]}},
+    {{"id": "add_item", "description": "Add item", "completion_signals": ["success", "added", "created"]}}
+  ]
+}}
+```
+
+Extract goals now:"""
+
+		messages = [
+			SystemMessage(content="You extract high-level phases from tasks for progress tracking."),
+			HumanMessage(content=planning_prompt)
+		]
+
+		response = await llm.ainvoke(messages)
+		response_text = response.content if hasattr(response, 'content') else str(response)
+
+		# Parse JSON
+		import json
+		import re
+
+		json_match = re.search(r'\{[\s\S]*"goals"[\s\S]*\}', response_text)
+		if json_match:
+			try:
+				plan_data = json.loads(json_match.group(0))
+				goals = plan_data.get("goals", [])
+
+				if goals:
+					logger.info(f"PLAN: Extracted {len(goals)} goals for page state tracking:")
+					for i, goal in enumerate(goals, 1):
+						logger.info(f"  {i}. [{goal['id']}] {goal['description']}")
+
+					logger.info("PLAN: ✅ LLM will manage detailed steps via todo.md")
+					logger.info("PLAN: ✅ Goals used ONLY for page state-based completion detection")
+
+					return {
+						"goals": goals,
+						"completed_goals": [],
+						"current_goal_index": 0,
+					}
+			except (json.JSONDecodeError, KeyError) as e:
+				logger.warning(f"PLAN: Could not parse goals: {e}")
+
+		# Fallback: Pure browser-use pattern (no goal tracking)
+		logger.info("PLAN: No goals extracted, using pure browser-use todo.md pattern")
+		return {
+			"goals": [],
+			"completed_goals": [],
+			"current_goal_index": 0,
+		}
+
+	except Exception as e:
+		logger.error(f"Error in plan node: {e}", exc_info=True)
+		return {
+			"goals": [],
+			"completed_goals": [],
+			"current_goal_index": 0,
+		}

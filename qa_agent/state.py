@@ -23,6 +23,12 @@ class QAAgentState(TypedDict):
     current_goal: Optional[str]  # Current sub-goal being worked on
     start_url: Optional[str]  # Initial URL to navigate to
 
+    # Multi-Step Task Planning (NEW - for complex workflows)
+    goals: List[Dict[str, Any]]  # Sequential goals parsed from task
+    completed_goals: List[str]  # IDs of completed goals
+    current_goal_index: int  # Index of current goal being worked on
+    task_context: Optional[str]  # Dynamic task description for current goal
+
     # Browser State (Serializable)
     browser_session_id: Optional[str]  # Session ID for lookup in registry (serializable)
     current_url: Optional[str]  # Current page URL
@@ -92,6 +98,10 @@ def create_initial_state(
         task=task,
         current_goal=None,
         start_url=start_url,
+        goals=[],  # NEW: Will be populated by PLAN node
+        completed_goals=[],  # NEW: Track completed goals
+        current_goal_index=0,  # NEW: Current goal being worked on
+        task_context=None,  # NEW: Dynamic task description
         browser_session_id=browser_session_id,
         current_url=None,
         browser_state_summary=None,
