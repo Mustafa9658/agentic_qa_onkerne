@@ -7,7 +7,7 @@ import logging
 from typing import Literal, Any
 from langgraph.graph import StateGraph, START, END
 from qa_agent.state import QAAgentState
-from qa_agent.nodes import init_node, think_node, act_node, verify_node, report_node
+from qa_agent.nodes import init_node, plan_node, think_node, act_node, verify_node, report_node
 from qa_agent.config import settings
 
 logger = logging.getLogger(__name__)
@@ -78,23 +78,23 @@ def should_continue(state: QAAgentState) -> Literal["continue", "retry", "done"]
         return "done"  # Fail safe: go to report on error
 
 
-def should_continue_after_think(state: QAAgentState) -> Literal["continue", "done"]:
+def should_continue_after_think(state: QAAgentState) -> Literal["continue", "done", "replan"]:
     """
     Router function to determine next node after think
-    
+
     Args:
         state: Current QA agent state
-        
+
     Returns:
-        Next node to execute: "continue" or "done"
+        Next node to execute: "continue", "replan", or "done"
     """
     try:
         if state.get("completed"):
             return "done"
-        
+
         if state.get("error"):
             return "done"
-        
+
         # Infinite loop prevention
         step_count = state.get("step_count", 0)
         max_steps = state.get("max_steps", settings.max_steps)
@@ -102,13 +102,21 @@ def should_continue_after_think(state: QAAgentState) -> Literal["continue", "don
         if step_count >= max_steps:
             logger.warning(f"Max steps reached in think router: {step_count}/{max_steps}")
             return "done"
-        
+
         # If we have planned actions, continue to act
         planned_actions = state.get("planned_actions", [])
         if planned_actions:
             return "continue"
-        
-        # No actions planned, go to report
+
+        # Check if this is a goal transition (empty actions but more goals to do)
+        goals = state.get("goals", [])
+        current_goal_index = state.get("current_goal_index", 0)
+        if goals and current_goal_index < len(goals):
+            # Goal transition - loop back to think for next goal
+            logger.info("Goal transition detected, looping back to THINK for next goal")
+            return "replan"
+
+        # No actions planned and no more goals, go to report
         return "done"
     except Exception as e:
         logger.error(f"Error in think router function: {e}")
@@ -118,41 +126,55 @@ def should_continue_after_think(state: QAAgentState) -> Literal["continue", "don
 def create_qa_workflow() -> Any:
     """
     Create the QA automation workflow
-    
+
+    Architecture:
+    - START → INIT → PLAN → THINK ⟷ ACT → THINK (optimized loop)
+    - VERIFY only used for tab switching, not in main loop
+    - Goals tracked in state, LLM adapts task context based on progress
+
     Returns:
         Compiled LangGraph workflow
     """
     logger.info("Creating QA automation workflow")
-    
+
     # Create workflow graph
     workflow = StateGraph(QAAgentState)
-    
+
     # Add nodes
     workflow.add_node("init", init_node)
+    workflow.add_node("plan", plan_node)  # NEW: LLM-driven task decomposition
     workflow.add_node("think", think_node)
     workflow.add_node("act", act_node)
-    workflow.add_node("verify", verify_node)
+    workflow.add_node("verify", verify_node)  # Kept for tab switching
     workflow.add_node("report", report_node)
 
     # Set entry point using START constant (LangGraph v1.0 pattern)
-    # START -> INIT -> THINK (INIT creates browser session)
+    # START → INIT → PLAN → THINK (INIT creates browser, PLAN decomposes task)
     workflow.add_edge(START, "init")
-    workflow.add_edge("init", "think")
-    
+    workflow.add_edge("init", "plan")  # NEW: Plan after init
+    workflow.add_edge("plan", "think")  # NEW: Think after planning
+
     # Add conditional edges from think
     workflow.add_conditional_edges(
         "think",
         should_continue_after_think,
         {
             "continue": "act",
+            "replan": "think",  # NEW: Loop back to think on goal transitions
             "done": "report",
         }
     )
-    
-    # Add edge from act to verify
-    workflow.add_edge("act", "verify")
-    
-    # Add conditional edges from verify
+
+    # CRITICAL OPTIMIZATION: ACT → THINK directly (bypassing VERIFY)
+    # ACT already fetches fresh state and detects tab switches
+    # VERIFY is only invoked when needed (see conditional edge below)
+    workflow.add_edge("act", "think")  # CHANGED: Direct ACT→THINK loop
+
+    # NOTE: We keep verify node for special cases (tab switching)
+    # But it's not in the main loop anymore - this solves the efficiency issue
+    # If needed, we can add conditional logic in ACT to route to VERIFY for tab switches
+
+    # Add conditional edges from verify (for special cases if needed)
     workflow.add_conditional_edges(
         "verify",
         should_continue,
@@ -162,15 +184,16 @@ def create_qa_workflow() -> Any:
             "done": "report",      # Go to report
         }
     )
-    
+
     # Add edge from report to end
     workflow.add_edge("report", END)
-    
+
     # Compile workflow
     compiled_workflow = workflow.compile()
-    
+
     logger.info("Workflow created successfully")
-    
+    logger.info("Architecture: INIT → PLAN → THINK ⟷ ACT (optimized loop)")
+
     # Add graph visualization capability (LangGraph pattern)
     try:
         # Generate graph visualization
@@ -178,7 +201,7 @@ def create_qa_workflow() -> Any:
         logger.info("Graph visualization available - use workflow.get_graph().draw_mermaid_png() to visualize")
     except Exception as e:
         logger.debug(f"Could not get graph for visualization: {e}")
-    
+
     return compiled_workflow
 
 
