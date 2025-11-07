@@ -8,6 +8,7 @@ This node:
 4. Captures action results
 5. Persists FileSystem state (LLM decides when to update todo.md via replace_file action)
 """
+import asyncio
 import logging
 from typing import Dict, Any
 from qa_agent.state import QAAgentState
@@ -101,8 +102,49 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 		print(f"\n  [{i}/{len(planned_actions)}] Executing: {action_type}")
 
 		try:
+			# STEP 1: Capture DOM state BEFORE action (for dynamic verification)
+			# This allows us to compare before/after and detect what actually changed
+			dom_before = None
+			url_before = None
+			title_before = None
+			errors_before = None
+			
+			# Only capture state for actions that modify the page
+			if action_type in ["click", "input", "select_dropdown", "scroll"]:
+				try:
+					# Get quick snapshot of current state
+					state_before = await session.get_browser_state_summary(include_screenshot=False, cached=True)
+					dom_before = len(state_before.dom_state.selector_map) if state_before.dom_state else 0
+					url_before = state_before.url
+					title_before = state_before.title
+					
+					# Check for existing errors on page BEFORE action
+					cdp_session = await session.get_or_create_cdp_session(focus=True)
+					errors_check = await cdp_session.cdp_client.send.Runtime.evaluate(
+						params={
+							"expression": """
+								(function() {
+									const errors = [];
+									// Look for error messages anywhere on page
+									document.querySelectorAll('[class*="error" i], [class*="invalid" i], [role="alert"], .text-danger').forEach(el => {
+										const text = el.textContent.trim();
+										if (text && text.length < 200 && text.length > 3) {
+											errors.push(text);
+										}
+									});
+									return errors;
+								})();
+							""",
+							"returnByValue": True,
+						},
+						session_id=cdp_session.session_id,
+					)
+					errors_before = errors_check.get('result', {}).get('value', [])
+					logger.debug(f"State before action: {dom_before} elements, URL: {url_before}, Errors: {len(errors_before)}")
+				except Exception as e:
+					logger.debug(f"Could not capture state before action: {e}")
 
-			# Execute action via browser-use Tools
+			# STEP 2: Execute action via browser-use Tools
 			# Browser-use extract action requires page_extraction_llm
 			# Get LLM instance for extract actions (browser-use pattern)
 			page_extraction_llm = None
@@ -151,6 +193,90 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 			metadata = result.metadata
 			success_flag = result.success  # May be None for non-done actions
 
+			# STEP 3: DYNAMIC VERIFICATION - Compare before/after state for ALL actions
+			# This works for any action type: click, input, dropdown, etc.
+			verification_msg = None
+			if success and dom_before is not None and action_type in ["click", "input", "select_dropdown", "scroll"]:
+				try:
+					# Wait briefly for changes to settle
+					await asyncio.sleep(0.2)
+					
+					# Get state AFTER action
+					state_after = await session.get_browser_state_summary(include_screenshot=False, cached=False)
+					dom_after = len(state_after.dom_state.selector_map) if state_after.dom_state else 0
+					url_after = state_after.url
+					title_after = state_after.title
+					
+					# Check for NEW errors that appeared AFTER action
+					cdp_session = await session.get_or_create_cdp_session(focus=True)
+					errors_check = await cdp_session.cdp_client.send.Runtime.evaluate(
+						params={
+							"expression": """
+								(function() {
+									const errors = [];
+									// Look for error messages anywhere on page
+									document.querySelectorAll('[class*="error" i], [class*="invalid" i], [role="alert"], .text-danger').forEach(el => {
+										const text = el.textContent.trim();
+										if (text && text.length < 200 && text.length > 3) {
+											errors.push(text);
+										}
+									});
+									return errors;
+								})();
+							""",
+							"returnByValue": True,
+						},
+						session_id=cdp_session.session_id,
+					)
+					errors_after = errors_check.get('result', {}).get('value', [])
+					
+					# Find NEW errors (not present before)
+					new_errors = [e for e in errors_after if e not in (errors_before or [])]
+					
+					# Analyze changes
+					dom_changed = abs(dom_after - dom_before) > 2  # More than 2 elements changed
+					url_changed = url_after != url_before
+					title_changed = title_after != title_before
+					has_new_errors = len(new_errors) > 0
+					
+					# Build verification message based on what changed
+					changes = []
+					if url_changed:
+						changes.append(f"Page navigated: {url_before} → {url_after}")
+					elif title_changed:
+						changes.append(f"Page title changed: '{title_before}' → '{title_after}'")
+					elif dom_changed:
+						if dom_after > dom_before:
+							changes.append(f"New content appeared ({dom_after - dom_before} new elements)")
+						elif dom_after < dom_before:
+							changes.append(f"Content disappeared ({dom_before - dom_after} fewer elements)")
+						else:
+							changes.append(f"DOM changed ({dom_after} elements)")
+					
+					if has_new_errors:
+						changes.append(f"⚠️ Error appeared: {new_errors[0]}")
+					
+					if not changes and not has_new_errors:
+						# No significant change detected
+						if action_type == "click":
+							# EXPLICIT FAILURE MARKER for clicks that don't trigger expected changes
+							changes.append("⚠️ CLICK HAD NO EFFECT: No page change detected (button may be disabled, validation may be blocking, or action already completed)")
+						elif action_type == "input":
+							changes.append("⚠️ No DOM change detected (this may be normal for input)")
+					
+					if changes:
+						verification_msg = " → " + "; ".join(changes)
+						logger.info(f"Dynamic verification: {verification_msg}")
+				
+				except Exception as verify_error:
+					logger.debug(f"Dynamic verification failed (non-critical): {verify_error}")
+			
+			# Enhance extracted_content with verification results
+			if verification_msg and extracted_content:
+				extracted_content = f"{extracted_content}{verification_msg}"
+			elif verification_msg:
+				extracted_content = verification_msg
+
 			logger.info(f"Action {action_type} {'succeeded' if success else 'failed'}: {extracted_content or error_msg}")
 			print(f"    ✅ {action_type} completed" if success else f"    ❌ {action_type} failed: {error_msg}")
 
@@ -169,6 +295,13 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 				"success_flag": success_flag,  # Browser-use success flag (None for regular actions)
 			})
 			executed_actions.append(action_dump)  # Store as dict for later checks
+			
+			# NOTE: We used to check for modals here, but removed it because:
+			# 1. Browser-use doesn't do hardcoded modal detection (only handles JS dialogs via PopupsWatchdog)
+			# 2. The dynamic verification system already detects DOM changes ("New content appeared", etc.)
+			# 3. Hardcoded selectors don't work across all websites
+			# 4. The LLM naturally sees new interactive elements in the next browser_state
+			# Result: Trust the dynamic system - it's more flexible and website-agnostic
 
 		except Exception as e:
 			# Browser-use pattern: Tools.act() catches BrowserError, TimeoutError, and general exceptions
@@ -287,19 +420,76 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 			previous_tabs = []
 
 	# Track consecutive failures (browser-use pattern: service.py:793-800)
-	# Browser-use checks: if single action AND it has error, increment failure counter
-	# If success (no error), reset failure counter to 0
+	# Logic: If ALL actions failed with errors → increment failures
+	#        If ANY action succeeded → reset failures to 0
+	# This tracks if LLM is completely stuck vs making some progress
 	consecutive_failures = state.get("consecutive_failures", 0)
-
-	if len(action_results) == 1 and action_results[0].get("error"):
-		# Single action failed - increment consecutive failures
+	
+	# CRITICAL: Detect repeated failed actions on same elements (LLM getting stuck in loop)
+	# Track last 3 steps of failed actions to detect patterns
+	recent_failed_actions = state.get("recent_failed_actions", [])
+	
+	# Collect current step's failed actions (with indices)
+	current_failed = []
+	for i, result in enumerate(action_results):
+		# Check if action failed (has explicit failure markers or errors)
+		extracted = result.get("extracted_content", "")
+		error = result.get("error")
+		is_failure = error or "⚠️ INPUT FAILED" in extracted or "⚠️ CLICK HAD NO EFFECT" in extracted
+		
+		if is_failure:
+			action_data = result.get("action", {})
+			# Extract action type and index for comparison
+			action_type = list(action_data.keys())[0] if action_data else "unknown"
+			action_params = action_data.get(action_type, {})
+			if isinstance(action_params, dict):
+				index = action_params.get("index")
+				if index is not None:
+					current_failed.append({"type": action_type, "index": index})
+	
+	# Check if current failed actions match recent history (same type + index repeated)
+	repeated_failures = []
+	for failed in current_failed:
+		# Check if this exact action (type + index) failed in last 2 steps
+		repeat_count = sum(
+			1 for past_step in recent_failed_actions[-2:]  # Last 2 steps
+			for past_action in past_step
+			if past_action.get("type") == failed["type"] and past_action.get("index") == failed["index"]
+		)
+		if repeat_count > 0:
+			repeated_failures.append(f"{failed['type']} at index {failed['index']}")
+	
+	# Add explicit warning to action_results if repetition detected
+	if repeated_failures:
+		logger.warning(f"🔁 Repeated failed actions detected: {repeated_failures}")
+		# Prepend warning to first failed action's extracted_content
+		for result in action_results:
+			extracted = result.get("extracted_content", "")
+			if "⚠️" in extracted:  # This is a failed action
+				warning = f"🔁 REPEATED FAILURE DETECTED: You tried this exact action before and it failed. Try a DIFFERENT approach (different element index, click to focus first, or alternative strategy).\n{extracted}"
+				result["extracted_content"] = warning
+				break  # Only add warning once
+	
+	# Update recent failed actions history (keep last 3 steps)
+	if current_failed:
+		recent_failed_actions.append(current_failed)
+		recent_failed_actions = recent_failed_actions[-3:]  # Keep last 3 steps
+	
+	# Check if any action succeeded (no error)
+	any_success = any(not r.get("error") for r in action_results)
+	all_failed = all(r.get("error") for r in action_results)
+	
+	if action_results and all_failed:
+		# All actions failed - increment consecutive failures
 		consecutive_failures += 1
-		logger.debug(f"🔄 Step {state.get('step_count', 0)}: Action failed, consecutive failures: {consecutive_failures}")
-	else:
-		# Success or multiple actions - reset consecutive failures
+		logger.debug(f"🔄 Step {state.get('step_count', 0)}: All {len(action_results)} actions failed, consecutive failures: {consecutive_failures}")
+	elif any_success:
+		# At least one action succeeded - reset consecutive failures
 		if consecutive_failures > 0:
-			logger.debug(f"🔄 Step {state.get('step_count', 0)}: Action succeeded, resetting consecutive failures from {consecutive_failures} to 0")
+			logger.debug(f"🔄 Step {state.get('step_count', 0)}: {sum(1 for r in action_results if not r.get('error'))}/{len(action_results)} actions succeeded, resetting consecutive failures from {consecutive_failures} to 0")
 			consecutive_failures = 0
+		# Also clear recent failed actions on success
+		recent_failed_actions = []
 
 	# Update history
 	existing_history = state.get("history", [])
@@ -327,6 +517,7 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 		"action_results": action_results,
 		"history": [new_history_entry],  # operator.add will append to existing (LangGraph reducer pattern)
 		"consecutive_failures": consecutive_failures,  # NEW: Track failure count (browser-use pattern)
+		"recent_failed_actions": recent_failed_actions,  # Track failed action patterns to detect loops
 		"tab_count": len(current_tab_ids) if 'current_tab_ids' in locals() else state.get("tab_count", 1),
 		"previous_tabs": previous_tabs,  # Track tabs for next comparison
 		"new_tab_id": new_tab_id,  # Pass to next node for tab switching

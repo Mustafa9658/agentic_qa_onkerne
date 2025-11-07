@@ -1502,8 +1502,107 @@ class DefaultActionWatchdog(BaseWatchdog):
 			# to update their internal state and trigger re-renders
 			await self._trigger_framework_events(object_id=object_id, cdp_session=cdp_session)
 
-			# Return coordinates metadata if available
-			return input_coordinates
+			# Step 5: Verify that the text was actually entered into the field
+			# This is CRITICAL for detecting cases where input fails silently
+			# (e.g., field is disabled, wrong field targeted, text gets cleared by validation)
+			# RETURN the actual field state so it can be included in ActionResult.extracted_content
+			actual_field_value = None
+			field_validation_errors = None
+			field_verification_passed = False
+			
+			try:
+				verify_result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+					params={
+						'functionDeclaration': """
+							function() {
+								// Get the actual value from the field
+								let actualValue = '';
+								if (this.value !== undefined) {
+									actualValue = String(this.value || '');
+								} else if (this.textContent !== undefined) {
+									actualValue = String(this.textContent || '');
+								} else if (this.innerText !== undefined) {
+									actualValue = String(this.innerText || '');
+								}
+								
+								// Check for validation errors near this field
+								let validationErrors = [];
+								
+								// Strategy 1: Check for error messages in parent containers
+								let parent = this.parentElement;
+								let levelsUp = 0;
+								while (parent && levelsUp < 3) {
+									// Look for error text in siblings or children
+									const errorElements = parent.querySelectorAll('[class*="error" i], [class*="invalid" i], [role="alert"], .text-danger, .error-message, .field-error');
+									errorElements.forEach(el => {
+										const errorText = el.textContent.trim();
+										if (errorText && errorText.length < 200) {
+											validationErrors.push(errorText);
+										}
+									});
+									parent = parent.parentElement;
+									levelsUp++;
+								}
+								
+								// Strategy 2: Check ARIA attributes on the field itself
+								if (this.getAttribute('aria-invalid') === 'true') {
+									const ariaError = this.getAttribute('aria-errormessage');
+									if (ariaError) {
+										const errorEl = document.getElementById(ariaError);
+										if (errorEl) {
+											validationErrors.push(errorEl.textContent.trim());
+										}
+									}
+								}
+								
+								// Strategy 3: Check for error classes on the field or parent
+								if (this.classList.contains('error') || this.classList.contains('invalid') || 
+									this.classList.contains('is-invalid') || this.parentElement?.classList.contains('error')) {
+									validationErrors.push('Field marked as invalid/error');
+								}
+								
+								return {
+									actualValue: actualValue,
+									expectedLength: arguments[0],
+									matches: actualValue.length >= arguments[0] * 0.8,  // Allow 80% match (for formatted fields)
+									validationErrors: validationErrors.length > 0 ? validationErrors.join('; ') : null
+								};
+							}
+						""",
+						'objectId': object_id,
+						'arguments': [{'value': len(text)}],
+						'returnByValue': True,
+					},
+					session_id=cdp_session.session_id,
+				)
+				
+				verification = verify_result.get('result', {}).get('value', {})
+				actual_field_value = verification.get('actualValue', '')
+				field_validation_errors = verification.get('validationErrors')
+				matches = verification.get('matches', False)
+				field_verification_passed = matches and not field_validation_errors
+				
+				if not matches:
+					self.logger.warning(
+						f'⚠️ Input verification failed: Expected text length ~{len(text)}, '
+						f'but field contains: "{actual_field_value[:50]}{"..." if len(actual_field_value) > 50 else ""}" '
+						f'(length: {len(actual_field_value)}). Field may not have been filled correctly.'
+					)
+				elif field_validation_errors:
+					self.logger.warning(f'⚠️ Field has validation errors: {field_validation_errors}')
+				else:
+					self.logger.debug(f'✅ Input verification passed: Field contains expected text (length: {len(actual_field_value)})')
+			except Exception as verify_error:
+				# Non-critical: if verification fails, log but don't fail the action
+				self.logger.debug(f'Could not verify input field value (non-critical): {verify_error}')
+
+			# Return coordinates metadata PLUS actual field state
+			# This allows the action handler to include actual results in extracted_content
+			result_metadata = input_coordinates or {}
+			result_metadata['actual_field_value'] = actual_field_value
+			result_metadata['field_validation_errors'] = field_validation_errors
+			result_metadata['field_verification_passed'] = field_verification_passed
+			return result_metadata
 
 		except Exception as e:
 			self.logger.error(f'Failed to input text via CDP: {type(e).__name__}: {e}')
