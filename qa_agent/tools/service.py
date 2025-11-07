@@ -347,6 +347,28 @@ class Tools(Generic[Context]):
 
 				logger.debug(log_msg)
 
+				# CRITICAL: Include actual field state in extracted_content for LLM
+				# This ensures LLM sees what ACTUALLY happened, not just what we tried
+				if input_metadata and isinstance(input_metadata, dict):
+					actual_value = input_metadata.get('actual_field_value')
+					validation_errors = input_metadata.get('field_validation_errors')
+					verification_passed = input_metadata.get('field_verification_passed', True)
+					
+					# Enhance message with actual results
+					# MAKE FAILURES EXPLICIT with warning prefix so LLM recognizes them immediately
+					if actual_value is not None and not has_sensitive_data:
+						if verification_passed:
+							msg += f" → Field now contains: '{actual_value}'"
+						else:
+							# EXPLICIT FAILURE MARKER - LLM must see this clearly
+							if actual_value:
+								msg = f"⚠️ INPUT FAILED: {msg} → Field contains: '{actual_value}' (expected: '{params.text}')"
+							else:
+								msg = f"⚠️ INPUT FAILED: {msg} → Field is empty (expected: '{params.text}')"
+						
+						if validation_errors:
+							msg += f" → Validation error: {validation_errors}"
+
 				# Include input coordinates in metadata if available
 				return ActionResult(
 					extracted_content=msg,
