@@ -65,6 +65,11 @@ class QAAgentState(TypedDict):
     max_steps: int  # Maximum steps allowed
     completed: bool  # Whether task is completed
     error: Optional[str]  # Error message if any
+
+    # Failure Tracking (browser-use pattern)
+    consecutive_failures: int  # Count of consecutive action failures
+    max_failures: int  # Maximum allowed consecutive failures (default: 3)
+    final_response_after_failure: bool  # Allow one final attempt after max_failures
     
     # History & Context
     history: List[dict]  # Step-by-step execution history
@@ -127,6 +132,9 @@ def create_initial_state(
         max_steps=max_steps,
         completed=False,
         error=None,
+        consecutive_failures=0,  # NEW: Track consecutive failures (browser-use pattern)
+        max_failures=3,  # NEW: Max allowed consecutive failures (browser-use default)
+        final_response_after_failure=True,  # NEW: Allow one final attempt (browser-use pattern)
         history=[],
         messages=[],
         report=None,
