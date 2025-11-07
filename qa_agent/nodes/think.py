@@ -452,11 +452,28 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         except Exception as e:
             logger.debug(f"Could not get page-filtered actions: {e}")
         
+        # Browser-use pattern: Force done action after max_failures (service.py:902-913)
+        # Check if we've reached max consecutive failures
+        consecutive_failures = state.get("consecutive_failures", 0)
+        max_failures = state.get("max_failures", 3)
+        final_response_after_failure = state.get("final_response_after_failure", True)
+
         # Browser-use pattern: Don't add hard-coded guidance - just send the browser state
         # The LLM will analyze the current browser_state and decide actions based on what it sees
         # If we switched tabs, the browser_state already contains the new page's elements
         # The LLM can see all interactive elements and their indices, so it can adapt dynamically
         enhanced_task = task
+
+        # Force done action after max failures (browser-use pattern: service.py:905-913)
+        if consecutive_failures >= max_failures and final_response_after_failure:
+            logger.warning(f"🛑 Max consecutive failures reached ({consecutive_failures}/{max_failures}), forcing done action")
+            # Create forced done message (browser-use pattern)
+            force_done_msg = f'You failed {max_failures} times. Therefore we terminate the agent.\n'
+            force_done_msg += 'Your only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.\n'
+            force_done_msg += 'If the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.\n'
+            force_done_msg += 'Include everything you found out for the ultimate task in the done text.\n'
+            force_done_msg += f'\nOriginal task: {task}'
+            enhanced_task = force_done_msg
         
         # Create file system for extract() action support
         # Browser-use pattern: FileSystem handles saving extracted content to files
@@ -791,6 +808,40 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         else:
             current_goal = f"Executing step {step_count}: {valid_actions[0].get('reasoning', '')[:50] if valid_actions else ''}"
         
+        # Action repetition detection (prevent infinite loops of same action)
+        # Compare current action with previous action from history
+        previous_action = None
+        if existing_history:
+            # Get most recent think node action
+            for entry in reversed(existing_history):
+                if entry.get("node") == "think" and entry.get("planned_actions"):
+                    previous_action = entry["planned_actions"][0]
+                    break
+
+        current_action = valid_actions[0] if valid_actions else None
+        action_repetition_count = state.get("action_repetition_count", 0)
+
+        # Check if repeating same action (same action type and same index)
+        if previous_action and current_action:
+            if (previous_action.get("action") == current_action.get("action") and
+                previous_action.get("index") == current_action.get("index")):
+                action_repetition_count += 1
+                logger.warning(f"⚠️ Action repeated {action_repetition_count} times: {current_action.get('action')} on index {current_action.get('index')}")
+
+                # Force done if repeated 3+ times
+                if action_repetition_count >= 3:
+                    logger.error(f"🛑 Action repeated {action_repetition_count} times, forcing completion")
+                    return {
+                        "error": f"Action '{current_action.get('action')}' on index {current_action.get('index')} repeated {action_repetition_count} times without success",
+                        "completed": True,
+                        "step_count": step_count,
+                    }
+            else:
+                # Different action - reset counter
+                action_repetition_count = 0
+        else:
+            action_repetition_count = 0
+
         # Clear tab switch flag after processing (so it doesn't persist to next step)
         state_updates = {
             "step_count": step_count,
@@ -804,6 +855,8 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
             # Goal tracking updates
             "completed_goals": completed_goals,
             "current_goal_index": current_goal_index,
+            # Action repetition tracking
+            "action_repetition_count": action_repetition_count,
         }
         
         # Clear tab switch flags after processing

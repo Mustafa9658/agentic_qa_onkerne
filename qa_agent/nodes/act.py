@@ -289,6 +289,21 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 			current_tab_ids = []
 			previous_tabs = []
 
+	# Track consecutive failures (browser-use pattern: service.py:793-800)
+	# Browser-use checks: if single action AND it has error, increment failure counter
+	# If success (no error), reset failure counter to 0
+	consecutive_failures = state.get("consecutive_failures", 0)
+
+	if len(action_results) == 1 and action_results[0].get("error"):
+		# Single action failed - increment consecutive failures
+		consecutive_failures += 1
+		logger.debug(f"🔄 Step {state.get('step_count', 0)}: Action failed, consecutive failures: {consecutive_failures}")
+	else:
+		# Success or multiple actions - reset consecutive failures
+		if consecutive_failures > 0:
+			logger.debug(f"🔄 Step {state.get('step_count', 0)}: Action succeeded, resetting consecutive failures from {consecutive_failures} to 0")
+			consecutive_failures = 0
+
 	# Update history
 	existing_history = state.get("history", [])
 	new_history_entry = {
@@ -299,6 +314,7 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 		"success_count": sum(1 for r in action_results if r.get("success")),
 		"total_count": len(action_results),
 		"new_tab_id": new_tab_id,  # Track if new tab was opened
+		"consecutive_failures": consecutive_failures,  # Track failure count
 	}
 
 	# Update previous_tabs for next step comparison
@@ -313,6 +329,7 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 		"executed_actions": executed_actions,
 		"action_results": action_results,
 		"history": existing_history + [new_history_entry],
+		"consecutive_failures": consecutive_failures,  # NEW: Track failure count (browser-use pattern)
 		"tab_count": len(current_tab_ids) if 'current_tab_ids' in locals() else state.get("tab_count", 1),
 		"previous_tabs": previous_tabs,  # Track tabs for next comparison
 		"new_tab_id": new_tab_id,  # Pass to next node for tab switching
