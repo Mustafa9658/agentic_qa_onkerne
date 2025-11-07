@@ -57,3 +57,13 @@ Thumbs.db
 # Documentation/Summary files
 ISSUES_SUMMARY.md
 
+# Frontend
+onkernal_frontend/
+node_modules/
+
+# Workspace and test files
+qa_agent_workspace/
+refined_test_steps.txt
+curl_request*.sh
+*.sh
+

@@ -6,7 +6,7 @@ Entry point for the QA Automation Agent API.
 import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api.routes import workflow, health
+from api.routes import workflow, health, test_plans, settings as settings_route, websocket
 from qa_agent.config import settings
 
 # Configure logging
@@ -35,6 +35,11 @@ app.add_middleware(
 # Include routers
 app.include_router(health.router, prefix=settings.api_prefix, tags=["Health"])
 app.include_router(workflow.router, prefix=settings.api_prefix, tags=["Workflow"])
+app.include_router(test_plans.router, prefix=settings.api_prefix, tags=["Test Plans"])
+app.include_router(settings_route.router, prefix=settings.api_prefix, tags=["Settings"])
+
+# WebSocket endpoint
+app.websocket("/ws")(websocket.websocket_endpoint)
 
 
 @app.on_event("startup")
