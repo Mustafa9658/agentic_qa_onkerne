@@ -35,6 +35,7 @@ from qa_agent.observability import observe_debug
 from qa_agent.tools.registry.service import Registry
 from qa_agent.tools.utils import get_click_description
 from qa_agent.tools.views import (
+	CheckboxAction,
 	ClickElementAction,
 	CloseTabAction,
 	DoneAction,
@@ -46,6 +47,7 @@ from qa_agent.tools.views import (
 	ScrollAction,
 	SearchAction,
 	SelectDropdownOptionAction,
+	SequentialFormFillAction,
 	SendKeysAction,
 	StructuredOutputAction,
 	SwitchTabAction,
@@ -354,6 +356,10 @@ class Tools(Generic[Context]):
 					validation_errors = input_metadata.get('field_validation_errors')
 					verification_passed = input_metadata.get('field_verification_passed', True)
 					
+					# CRITICAL: Surface console errors to LLM for full visibility
+					console_errors = input_metadata.get('console_errors')
+					console_validation_errors = input_metadata.get('console_validation_errors')
+					
 					# Enhance message with actual results
 					# MAKE FAILURES EXPLICIT with warning prefix so LLM recognizes them immediately
 					if actual_value is not None and not has_sensitive_data:
@@ -368,6 +374,17 @@ class Tools(Generic[Context]):
 						
 						if validation_errors:
 							msg += f" → Validation error: {validation_errors}"
+					
+					# Add console errors to message for LLM visibility
+					if console_validation_errors:
+						# Format validation errors clearly
+						validation_msgs = '; '.join(console_validation_errors[:2])  # Max 2 for token efficiency
+						msg += f" → Console validation errors: {validation_msgs}"
+					
+					if console_errors:
+						# Format JavaScript errors clearly
+						error_msgs = '; '.join(console_errors[:2])  # Max 2 for token efficiency
+						msg += f" → Console errors: {error_msgs}"
 
 				# Include input coordinates in metadata if available
 				return ActionResult(
@@ -958,6 +975,98 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				long_term_memory=dropdown_data['long_term_memory'],
 				include_extracted_content_only_once=True,
 			)
+
+		@self.registry.action(
+			'Check or uncheck a checkbox/radio button. Use checked=True to ensure checked, checked=False to ensure unchecked, checked=None to toggle.',
+			param_model=CheckboxAction,
+		)
+		async def checkbox(params: CheckboxAction, browser_session: BrowserSession):
+			"""Handle checkbox/radio button with state management."""
+			node = await browser_session.get_element_by_index(params.index)
+			if node is None:
+				return ActionResult(error=f'Element index {params.index} not found')
+			
+			# Verify it's a checkbox/radio
+			if node.tag_name.lower() not in ['input']:
+				return ActionResult(error=f'Element is not an input (tag: {node.tag_name})')
+			
+			input_type = node.attributes.get('type', '').lower()
+			if input_type not in ['checkbox', 'radio']:
+				return ActionResult(error=f'Element is not a checkbox/radio (type: {input_type})')
+			
+			# Create element and check/uncheck
+			from qa_agent.actor.element import Element
+			element = Element(
+				browser_session,
+				node.backend_node_id,
+				browser_session.agent_focus.session_id if browser_session.agent_focus else None
+			)
+			
+			await element.check(force_state=params.checked)
+			
+			# Get final state
+			final_state = await element.get_checkbox_state()
+			state_str = 'checked' if final_state['checked'] else 'unchecked'
+			
+			return ActionResult(
+				extracted_content=f'Checkbox is now {state_str}',
+				long_term_memory=f'Set checkbox {params.index} to {state_str}'
+			)
+
+		@self.registry.action(
+			'Fill form fields sequentially in tab order. Use when filling multiple form fields.',
+			param_model=SequentialFormFillAction,
+		)
+		async def fill_form_sequential(
+			params: SequentialFormFillAction,
+			browser_session: BrowserSession
+		):
+			"""Fill form fields in tab order."""
+			from qa_agent.dom.service import DomService
+			
+			async with DomService(browser_session) as dom_service:
+				# Get form elements in tab order
+				tab_order_elements = await dom_service.get_tab_order_elements(
+					browser_session.current_target_id
+				)
+				
+				# Filter to input/textarea/select elements only
+				form_fields = [
+					elem for elem in tab_order_elements
+					if elem.tag_name.lower() in ['input', 'textarea', 'select']
+				]
+				
+				results = []
+				for i, field in enumerate(form_fields):
+					field_name = field.attributes.get('name') or field.attributes.get('id') or f'field_{i}'
+					
+					# Get value from params.field_values dict
+					if field_name in params.field_values:
+						value = params.field_values[field_name]
+						
+						# Fill field
+						if field.tag_name.lower() == 'select':
+							# Use dropdown selection
+							await select_dropdown(
+								params=SelectDropdownOptionAction(index=field.backend_node_id, text=value),
+								browser_session=browser_session
+							)
+						else:
+							# Use text input
+							await input(
+								params=InputTextAction(index=field.backend_node_id, text=value),
+								browser_session=browser_session
+							)
+						
+						results.append(f'{field_name}: {value}')
+						
+						# Small delay between fields
+						await asyncio.sleep(0.1)
+				
+				return ActionResult(
+					extracted_content=f'Filled {len(results)} form fields: {", ".join(results)}',
+					long_term_memory=f'Sequentially filled form: {", ".join(results)}'
+				)
 
 		@self.registry.action(
 			'Select an option from a dropdown/select element or ARIA combobox by the exact text of the option. Use after dropdown_options to see available choices. Works for native <select> and custom dropdowns. IMPORTANT: Use the container element index (role=combobox, role=listbox, role=menu, or <select> tag), NOT option element indices. The action searches for options within the container and clicks the matching option. Alternative: When dropdown is already open and option elements (role=option) are visible in browser_state, you can click them directly using the click action.',

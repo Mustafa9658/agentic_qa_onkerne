@@ -524,9 +524,96 @@ class Element:
 		params: 'FocusParameters' = {'nodeId': node_id}
 		await self._client.send.DOM.focus(params, session_id=self._session_id)
 
-	async def check(self) -> None:
-		"""Check or uncheck a checkbox/radio button."""
-		await self.click()
+	async def get_checkbox_state(self) -> dict:
+		"""Get current checkbox/radio button state."""
+		node_id = await self._get_node_id()
+		
+		# Get element attributes
+		attrs_result = await self._client.send.DOM.getAttributes(
+			params={'nodeId': node_id},
+			session_id=self._session_id
+		)
+		
+		attributes = {}
+		attrs = attrs_result.get('attributes', [])
+		for i in range(0, len(attrs), 2):
+			if i + 1 < len(attrs):
+				attributes[attrs[i]] = attrs[i + 1]
+		
+		# Get checked state via JavaScript
+		result = await self._client.send.DOM.resolveNode(
+			params={'nodeId': node_id},
+			session_id=self._session_id
+		)
+		object_id = result['object']['objectId']
+		
+		state_result = await self._client.send.Runtime.callFunctionOn(
+			params={
+				'functionDeclaration': '''
+					function() {
+						return {
+							checked: this.checked,
+							indeterminate: this.indeterminate,
+							value: this.value || null,
+							type: this.type || 'checkbox'
+						};
+					}
+				''',
+				'objectId': object_id,
+				'returnByValue': True
+			},
+			session_id=self._session_id
+		)
+		
+		state = state_result.get('result', {}).get('value', {})
+		
+		return {
+			'checked': state.get('checked', False),
+			'indeterminate': state.get('indeterminate', False),
+			'value': state.get('value'),
+			'type': state.get('type', 'checkbox'),
+			'name': attributes.get('name'),
+			'id': attributes.get('id')
+		}
+
+	async def check(self, force_state: bool | None = None) -> None:
+		"""
+		Check or uncheck a checkbox/radio button.
+		
+		Args:
+			force_state: True to check, False to uncheck, None to toggle
+		"""
+		current_state = await self.get_checkbox_state()
+		is_checked = current_state['checked']
+		is_indeterminate = current_state['indeterminate']
+		
+		# Handle indeterminate state
+		if is_indeterminate:
+			logger.debug('Checkbox is in indeterminate state, clicking to resolve')
+			await self.click()
+			await asyncio.sleep(0.1)
+			# Re-check state after click
+			current_state = await self.get_checkbox_state()
+			is_checked = current_state['checked']
+		
+		# Determine target state
+		if force_state is None:
+			# Toggle: click if unchecked, don't click if checked
+			target_state = not is_checked
+		else:
+			target_state = force_state
+		
+		# Only click if state needs to change
+		if is_checked != target_state:
+			await self.click()
+			
+			# Verify state changed
+			await asyncio.sleep(0.1)
+			new_state = await self.get_checkbox_state()
+			if new_state['checked'] != target_state:
+				raise RuntimeError(f'Failed to set checkbox state: expected {target_state}, got {new_state["checked"]}')
+		else:
+			logger.debug(f'Checkbox already in desired state: {is_checked}')
 
 	async def select_option(self, values: str | list[str]) -> None:
 		"""Select option(s) in a select element."""

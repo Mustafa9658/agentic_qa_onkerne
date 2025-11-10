@@ -102,3 +102,17 @@ class GetDropdownOptionsAction(BaseModel):
 class SelectDropdownOptionAction(BaseModel):
 	index: int = Field(description='Index of the dropdown container element (element with role=combobox, role=listbox, role=menu, or <select> tag). Do NOT use option element indices (elements with role=option or role=menuitem). The action searches for options within this container and clicks the matching option.')
 	text: str = Field(description='exact text/value')
+
+
+class CheckboxAction(BaseModel):
+	index: int = Field(ge=1, description='Element index from browser_state')
+	checked: bool | None = Field(
+		default=None,
+		description='True to check, False to uncheck, None to toggle current state'
+	)
+
+
+class SequentialFormFillAction(BaseModel):
+	field_values: dict[str, str] = Field(
+		description='Dictionary mapping field names/ids to values. Example: {"email": "user@example.com", "password": "secret123"}'
+	)
