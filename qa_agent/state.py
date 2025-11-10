@@ -28,6 +28,7 @@ class QAAgentState(TypedDict):
     
     # ========== Browser Session ==========
     browser_session_id: Optional[str]  # Browser session identifier
+    screenshot_service: Optional[Any]  # Screenshot service for judge/GIF (not serialized)
     
     # ========== Step Tracking ==========
     step_count: int  # Current step number (incremented each step)
@@ -141,6 +142,7 @@ def create_initial_state(
         
         # Browser session
         "browser_session_id": None,
+        "screenshot_service": None,  # Initialized in init_node
         
         # Step tracking
         "step_count": 0,

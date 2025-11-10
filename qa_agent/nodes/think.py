@@ -70,19 +70,27 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
             # This ensures we see dropdowns, modals, and dynamic content that appeared after actions
             logger.info("✅ Using pre-fetched fresh state from act node (after DOM stability wait)")
             logger.info("   This ensures LLM sees CURRENT page structure (dropdowns, modals, new content)")
-            
-            # Still need to get full BrowserStateSummary object for LLM (not just summary dict)
-            # But we can use cached=False to ensure consistency
-            browser_state = await browser_session.get_browser_state_summary(
-                include_screenshot=False,
-                include_recent_events=False,
-                cached=False  # Force fresh to ensure consistency with Act node's state
-            )
-            
-            # Verify we got the same URL as Act node reported (sanity check)
-            act_node_url = state.get("current_url")
-            if act_node_url and browser_state.url != act_node_url:
-                logger.warning(f"⚠️ URL mismatch: Act node reported {act_node_url}, Think node got {browser_state.url}")
+
+            # FIX: Use the ACTUAL BrowserStateSummary object ACT already fetched
+            # This eliminates the "1 step ahead" race condition
+            browser_state = state.get("fresh_browser_state_object")
+
+            if browser_state:
+                logger.info("✅ Using ACTUAL fresh_browser_state_object from ACT (no re-fetch, perfect sync)")
+                act_node_url = state.get("current_url")
+                if act_node_url and browser_state.url == act_node_url:
+                    logger.info(f"✅ URL verified: {act_node_url[:60]}")
+            else:
+                # Fallback: ACT didn't pass the object (older code), fetch it
+                logger.warning("⚠️ fresh_browser_state_object not found, falling back to re-fetch")
+                browser_state = await browser_session.get_browser_state_summary(
+                    include_screenshot=False,
+                    include_recent_events=False,
+                    cached=False
+                )
+                act_node_url = state.get("current_url")
+                if act_node_url and browser_state.url != act_node_url:
+                    logger.warning(f"⚠️ URL mismatch: Act node reported {act_node_url}, Think node got {browser_state.url}")
         else:
             # Normal flow: fetch fresh state (first step, or if Act node didn't provide state)
             # CRITICAL: Check if verify node just switched tabs - log current tab before getting state
@@ -392,7 +400,33 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
                         if error:
                             error_text = error[:200] + '......' + error[-100:] if len(error) > 200 else error
                             action_results_text += f'Error: {error_text}\n'
-                    
+
+                    # FORM INCOMPLETE WARNING: Add explicit instructions if form has issues
+                    form_incomplete = state.get("form_incomplete", False)
+                    form_state = state.get("form_state", {})
+                    validation_errors_count = state.get("validation_errors_count", 0)
+                    blocking_errors_count = state.get("blocking_errors_count", 0)
+
+                    if form_incomplete and (validation_errors_count > 0 or blocking_errors_count > 0):
+                        # Add explicit form completion warning
+                        incomplete_fields = form_state.get("required_empty_fields", [])
+                        validation_errors = form_state.get("validation_errors", [])
+
+                        form_warning = "\n⚠️ FORM INCOMPLETE - MUST FIX BEFORE PROCEEDING:\n"
+                        if validation_errors:
+                            form_warning += f"  • Validation errors: {'; '.join(validation_errors[:2])}\n"
+                        if incomplete_fields:
+                            field_labels = [f['label'] for f in incomplete_fields[:3]]
+                            form_warning += f"  • {len(incomplete_fields)} required fields still empty: {', '.join(field_labels)}"
+                            if len(incomplete_fields) > 3:
+                                form_warning += f", +{len(incomplete_fields)-3} more"
+                            form_warning += "\n"
+                        form_warning += "  • DO NOT click Submit or navigate away until form is complete\n"
+                        form_warning += "  • Review CURRENT <browser_state> to see correct field indices\n"
+                        form_warning += "  • Fix validation errors FIRST, then fill remaining required fields\n"
+
+                        action_results_text += form_warning
+
                     if action_results_text:
                         step_content_parts.append(f'Result\n{action_results_text.strip()}')
                 
@@ -1014,6 +1048,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         # Clear fresh_state_available flag after using it (so it doesn't persist)
         if fresh_state_available:
             state_updates["fresh_state_available"] = False
+            state_updates["fresh_browser_state_object"] = None  # Clear object to free memory
             state_updates["page_changed"] = False
         
         # CRITICAL: Persist FileSystem state for todo.md tracking (Phase 1)

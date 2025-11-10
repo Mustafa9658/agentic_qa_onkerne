@@ -280,6 +280,19 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 			logger.info(f"Action {action_type} {'succeeded' if success else 'failed'}: {extracted_content or error_msg}")
 			print(f"    ✅ {action_type} completed" if success else f"    ❌ {action_type} failed: {error_msg}")
 
+			# FORM FIELD WAITING: Add small delay between form field actions for validation to settle
+			# This ensures client-side validation and auto-fill logic completes before next field
+			if success and action_type in ["input", "select_dropdown"] and i < len(planned_actions):
+				# Check if next action is also a form field (input or dropdown)
+				next_action = planned_actions[i] if i < len(planned_actions) else None
+				if next_action:
+					next_action_dump = next_action.model_dump(exclude_unset=True)
+					next_action_type = list(next_action_dump.keys())[0] if next_action_dump else ""
+					if next_action_type in ["input", "select_dropdown"]:
+						# Next action is also form field - wait for validation/autofill
+						logger.debug("⏳ Waiting 0.3s between form fields for validation to settle...")
+						await asyncio.sleep(0.3)
+
 			# Store complete result (all browser-use ActionResult fields)
 			# Store action as dict for history serialization
 			action_results.append({
@@ -370,10 +383,99 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 	current_title = fresh_browser_state.title
 	selector_map = fresh_browser_state.dom_state.selector_map if fresh_browser_state.dom_state else {}
 	element_count = len(selector_map)
-	
+
 	logger.info(f"✅ Fresh state retrieved: {current_title[:50]} ({current_url[:60]})")
 	logger.info(f"   Interactive elements: {element_count}")
 	logger.info(f"   💾 Passing fresh state to Think node - LLM will see CURRENT page structure")
+
+	# FORM STATE DETECTION: Check if we're on a form with incomplete required fields
+	# This helps LLM understand "don't proceed until form is complete"
+	form_state = {}
+	try:
+		cdp_session = await session.get_or_create_cdp_session(focus=True)
+		form_check = await cdp_session.cdp_client.send.Runtime.evaluate(
+			params={
+				"expression": """
+					(function() {
+						const forms = document.querySelectorAll('form');
+						const required_empty = [];
+						const validation_errors = [];
+
+						forms.forEach(form => {
+							// Find required fields that are empty
+							form.querySelectorAll('[required], [aria-required="true"]').forEach(field => {
+								if (field.offsetParent !== null && (!field.value || field.value.trim() === '')) {
+									required_empty.push({
+										tag: field.tagName,
+										type: field.type || 'text',
+										name: field.name || field.id || 'unnamed',
+										label: field.labels?.[0]?.textContent?.trim() || field.placeholder || 'unlabeled'
+									});
+								}
+							});
+
+							// Find visible validation errors (multiple detection strategies)
+							const errorSelectors = [
+								'.error', '.invalid', '.text-danger',  // Common conventions
+								'[role="alert"]',  // ARIA standard
+								'[class*="error" i]', '[class*="invalid" i]',  // Any class with "error"/"invalid"
+								'[class*="validation" i]', '[class*="warning" i]',  // Validation/warning classes
+								'.error-message', '.field-error', '.form-error',  // Specific error classes
+								'.help-block.error', '.feedback.error',  // Framework patterns
+								'[aria-invalid="true"] + *',  // Error message next to invalid field
+								'[data-error]', '[data-validation-error]',  // Data attributes
+							];
+
+							// Deduplicate errors by text content
+							const seenErrors = new Set();
+							errorSelectors.forEach(selector => {
+								try {
+									form.querySelectorAll(selector).forEach(el => {
+										// Only visible elements
+										if (el.offsetParent !== null) {
+											const text = el.textContent.trim();
+											// Valid error: 3+ chars, not too long, not already seen
+											if (text.length >= 3 && text.length <= 200 && !seenErrors.has(text)) {
+												// Filter out false positives (navigation, labels, etc.)
+												const lowerText = text.toLowerCase();
+												const isFalsePositive =
+													lowerText === 'error' ||  // Just the word "error"
+													lowerText === 'required' ||  // Just the word "required"
+													text.includes('Error:') && text.length < 10;  // Generic "Error:" labels
+
+												if (!isFalsePositive) {
+													validation_errors.push(text.substring(0, 100));
+													seenErrors.add(text);
+												}
+											}
+										}
+									});
+								} catch (e) {
+									// Ignore invalid selectors
+								}
+							});
+						});
+
+						return {
+							has_forms: forms.length > 0,
+							required_empty_count: required_empty.length,
+							required_empty_fields: required_empty.slice(0, 5),  // First 5 only
+							validation_errors: validation_errors.slice(0, 3),  // First 3 only
+							form_incomplete: required_empty.length > 0 || validation_errors.length > 0
+						};
+					})();
+				""",
+				"returnByValue": True,
+			},
+			session_id=cdp_session.session_id,
+		)
+		form_state = form_check.get('result', {}).get('value', {})
+
+		if form_state.get('form_incomplete'):
+			logger.warning(f"⚠️ FORM INCOMPLETE DETECTED: {form_state.get('required_empty_count', 0)} required fields empty, {len(form_state.get('validation_errors', []))} validation errors")
+	except Exception as e:
+		logger.debug(f"Form state detection failed (non-critical): {e}")
+		form_state = {"has_forms": False, "form_incomplete": False}
 	
 	# Check for new tabs opened by actions (e.g., ChatGPT login opens new tab)
 	# Browser-use pattern: detect new tabs by comparing before/after tab lists
@@ -475,20 +577,56 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 		recent_failed_actions.append(current_failed)
 		recent_failed_actions = recent_failed_actions[-3:]  # Keep last 3 steps
 	
-	# Check if any action succeeded (no error)
-	any_success = any(not r.get("error") for r in action_results)
-	all_failed = all(r.get("error") for r in action_results)
-	
-	if action_results and all_failed:
+	# SMART FAILURE TRACKING: Detect validation errors and blocking errors
+	# These indicate we're stuck on same form/page even if some actions succeeded
+	validation_errors = []
+	blocking_errors = []
+	successes = []
+
+	for r in action_results:
+		extracted = r.get("extracted_content", "")
+		error = r.get("error", "")
+
+		# Validation errors: form validation, required fields, invalid input
+		# Use comprehensive keyword list to catch different error message formats
+		validation_keywords = [
+			"invalid", "required", "must be", "must not", "validation", "error appeared",
+			"cannot be", "should be", "please enter", "please provide", "please select",
+			"format is", "does not match", "incorrect", "not valid", "not allowed",
+			"minimum", "maximum", "too short", "too long", "out of range"
+		]
+		if any(keyword in extracted.lower() or keyword in error.lower() for keyword in validation_keywords):
+			validation_errors.append(r)
+		# Blocking errors: element not found, action had no effect
+		elif any(keyword in extracted or keyword in error
+		         for keyword in ["not found", "HAD NO EFFECT", "disabled", "not interactable", "not visible"]):
+			blocking_errors.append(r)
+		# Success: no error
+		elif not error:
+			successes.append(r)
+
+	any_success = len(successes) > 0
+	all_failed = len(successes) == 0
+	has_blocking_issues = len(validation_errors) > 0 or len(blocking_errors) > 0
+
+	# CRITICAL: Partial success WITH blocking issues = we're STUCK, not making progress
+	if has_blocking_issues:
+		# Even if some actions succeeded, we have validation/blocking errors
+		# This means we're stuck on same form/page and need to fix errors
+		consecutive_failures += 1
+		logger.warning(f"🔄 PARTIAL SUCCESS WITH BLOCKING ISSUES: {len(successes)}/{len(action_results)} succeeded, BUT {len(validation_errors)} validation errors + {len(blocking_errors)} blocking errors")
+		logger.warning(f"   → consecutive_failures: {consecutive_failures} (incremented because we're STUCK)")
+		# Keep recent_failed_actions for context
+	elif all_failed:
 		# All actions failed - increment consecutive failures
 		consecutive_failures += 1
 		logger.debug(f"🔄 Step {state.get('step_count', 0)}: All {len(action_results)} actions failed, consecutive failures: {consecutive_failures}")
 	elif any_success:
-		# At least one action succeeded - reset consecutive failures
+		# Pure success - no validation/blocking errors
 		if consecutive_failures > 0:
-			logger.debug(f"🔄 Step {state.get('step_count', 0)}: {sum(1 for r in action_results if not r.get('error'))}/{len(action_results)} actions succeeded, resetting consecutive failures from {consecutive_failures} to 0")
+			logger.debug(f"🔄 Step {state.get('step_count', 0)}: {len(successes)}/{len(action_results)} actions succeeded cleanly, resetting consecutive failures from {consecutive_failures} to 0")
 			consecutive_failures = 0
-		# Also clear recent failed actions on success
+		# Clear recent failed actions on clean success
 		recent_failed_actions = []
 
 	# Update history
@@ -502,6 +640,7 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 		"total_count": len(action_results),
 		"new_tab_id": new_tab_id,  # Track if new tab was opened
 		"consecutive_failures": consecutive_failures,  # Track failure count
+		"screenshot_path": None,  # Will be updated after screenshot capture
 	}
 
 	# Update previous_tabs for next step comparison
@@ -510,7 +649,30 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 	# Check if any executed action was a tab switch - mark it for enhanced LLM context
 	# This ensures think node provides context about the new page structure
 	just_switched_tab = any(a.get("action") == "switch" for a in executed_actions)
-	
+
+	# SCREENSHOT CAPTURE FOR JUDGE/GIF: Capture screenshot after all actions complete
+	# This allows judge evaluation and GIF generation to visualize execution
+	screenshot_path = None
+	try:
+		screenshot_service = state.get("screenshot_service")
+		if screenshot_service:
+			# Capture screenshot from fresh browser state
+			screenshot_b64 = fresh_browser_state.screenshot if hasattr(fresh_browser_state, 'screenshot') and fresh_browser_state.screenshot else None
+
+			# If not in state, get fresh screenshot
+			if not screenshot_b64:
+				screenshot_state = await session.get_browser_state_summary(include_screenshot=True, cached=False)
+				screenshot_b64 = screenshot_state.screenshot
+
+			if screenshot_b64:
+				step_number = state.get("step_count", 0)
+				screenshot_path = await screenshot_service.store_screenshot(screenshot_b64, step_number)
+				logger.debug(f"📸 Screenshot saved: {screenshot_path}")
+				# Update history entry with screenshot path
+				new_history_entry["screenshot_path"] = screenshot_path
+	except Exception as e:
+		logger.warning(f"Failed to capture screenshot (non-critical): {e}")
+
 	# Build return state with fresh browser state info
 	return_state = {
 		"executed_actions": executed_actions,
@@ -524,6 +686,7 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 		"new_tab_url": new_tab_url,  # Pass URL for context
 		# CRITICAL: Pass fresh state to Think node (browser-use pattern: backend 1 step ahead)
 		"fresh_state_available": True,  # Flag to tell Think node we have fresh state
+		"fresh_browser_state_object": fresh_browser_state,  # ← FIX: Pass actual object, not just summary
 		"page_changed": has_page_changing_action or (previous_url and current_url != previous_url),
 		"current_url": current_url,  # Update current URL
 		"browser_state_summary": {  # Store summary for Think node
@@ -531,10 +694,15 @@ async def act_node(state: QAAgentState) -> Dict[str, Any]:
 			"title": current_title,
 			"element_count": element_count,
 			"tabs": [{"id": t.target_id[-4:], "title": t.title, "url": t.url} for t in current_tabs],
+			"screenshot_path": screenshot_path,  # For judge evaluation and GIF generation
 		},
 		"dom_selector_map": selector_map,  # Cache selector map for Think node
 		"previous_url": current_url,  # Track URL for next step comparison
 		"previous_element_count": element_count,  # Track element count for change detection
+		"form_state": form_state,  # Form completion state for THINK node
+		"form_incomplete": form_state.get("form_incomplete", False),  # Flag for incomplete forms
+		"validation_errors_count": len(validation_errors),  # Count of validation errors
+		"blocking_errors_count": len(blocking_errors),  # Count of blocking errors
 	}
 	
 	# If we explicitly switched tabs, mark it so think node provides enhanced context
