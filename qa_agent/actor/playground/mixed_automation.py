@@ -2,7 +2,8 @@ import asyncio
 
 from pydantic import BaseModel
 
-from browser_use import Browser, ChatOpenAI
+from qa_agent.browser import BrowserSession as Browser
+from qa_agent.llm import get_llm
 
 TASK = """
 On the current wikipedia page, find the latest huge edit and tell me what is was about.
@@ -19,7 +20,7 @@ class LatestEditFinder(BaseModel):
 	edit_url: str
 
 
-llm = ChatOpenAI('gpt-4.1-mini')
+llm = get_llm(model='gpt-4o-mini')
 
 
 async def main():

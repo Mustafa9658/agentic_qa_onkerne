@@ -485,8 +485,8 @@ class BrowserSession(BaseModel):
 		"""Get instance-specific logger with session ID in the name"""
 		# **regenerate it every time** because our id and str(self) can change as browser connection state changes
 		# if self._logger is None or not self._cdp_client_root:
-		# 	self._logger = logging.getLogger(f'browser_use.{self}')
-		return logging.getLogger(f'browser_use.{self}')
+		# 	self._logger = logging.getLogger(f'qa_agent.{self}')
+		return logging.getLogger(f'qa_agent.{self}')
 
 	@cached_property
 	def _id_for_logs(self) -> str:
