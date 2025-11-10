@@ -1313,6 +1313,13 @@ class DefaultActionWatchdog(BaseWatchdog):
 		For date/time inputs, uses direct value assignment instead of typing.
 		"""
 
+		# Clear console messages before interaction for error tracking
+		console_start_timestamp = None
+		if hasattr(self.browser_session, '_console_watchdog') and self.browser_session._console_watchdog:
+			# Store timestamp to filter console messages during this interaction
+			import time
+			console_start_timestamp = time.time()
+
 		try:
 			# Get CDP client
 			cdp_client = self.browser_session.cdp_client
@@ -1403,106 +1410,136 @@ class DefaultActionWatchdog(BaseWatchdog):
 				if not cleared_successfully:
 					self.logger.warning('⚠️ Text field clearing failed, typing may append to existing text')
 
-			# Step 4: Type the text character by character using proper human-like key events
-			# This emulates exactly how a human would type, which modern websites expect
-			if is_sensitive:
-				# Note: sensitive_key_name is not passed to this low-level method,
-				# but we could extend the signature if needed for more granular logging
-				self.logger.debug('🎯 Typing <sensitive> character by character')
-			else:
-				self.logger.debug(f'🎯 Typing text character by character: "{text}"')
-
-			for i, char in enumerate(text):
-				# Handle newline characters as Enter key
-				if char == '\n':
-					# Send proper Enter key sequence
-					await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
-						params={
-							'type': 'keyDown',
-							'key': 'Enter',
-							'code': 'Enter',
-							'windowsVirtualKeyCode': 13,
-						},
-						session_id=cdp_session.session_id,
+			# Step 4: Try Input.insertText first (faster, more reliable) - fallback to character-by-character if it fails
+			input_type = element_node.attributes.get('type', '').lower()
+			use_insert_text = input_type not in ['date', 'time', 'datetime-local', 'month', 'week', 'color', 'range']
+			
+			if use_insert_text and len(text) > 5:  # Use insertText for longer text (more benefit)
+				try:
+					# Try Input.insertText for faster, more reliable text insertion
+					await cdp_session.cdp_client.send.Input.insertText(
+						params={'text': text},
+						session_id=cdp_session.session_id
 					)
+					
+					# Trigger framework events after insertText
+					await self._trigger_framework_events(object_id=object_id, cdp_session=cdp_session)
+					
+					self.logger.debug(f'✅ Used Input.insertText for fast text insertion: {len(text)} chars')
+					
+					# Skip to verification step (skip character-by-character typing)
+					# Continue to Step 5 for verification
+				except (AttributeError, TypeError, KeyError) as e:
+					# insertText not available in cdp_use library or method doesn't exist
+					self.logger.debug(f'Input.insertText not available, falling back to character-by-character: {e}')
+					# Fall through to character-by-character method
+					use_insert_text = False
+				except Exception as e:
+					# Other error - log and fallback
+					self.logger.debug(f'Input.insertText failed, falling back to character-by-character: {e}')
+					use_insert_text = False
+			
+			# Step 4b: Type the text character by character using proper human-like key events (fallback or for short text)
+			if not use_insert_text or len(text) <= 5:
+				# This emulates exactly how a human would type, which modern websites expect
+				if is_sensitive:
+					# Note: sensitive_key_name is not passed to this low-level method,
+					# but we could extend the signature if needed for more granular logging
+					self.logger.debug('🎯 Typing <sensitive> character by character')
+				else:
+					self.logger.debug(f'🎯 Typing text character by character: "{text}"')
 
-					# Small delay to emulate human typing speed
+				for i, char in enumerate(text):
+					# Handle newline characters as Enter key
+					if char == '\n':
+						# Send proper Enter key sequence
+						await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
+							params={
+								'type': 'keyDown',
+								'key': 'Enter',
+								'code': 'Enter',
+								'windowsVirtualKeyCode': 13,
+							},
+							session_id=cdp_session.session_id,
+						)
+
+						# Small delay to emulate human typing speed
+						await asyncio.sleep(0.001)
+
+						# Send char event with carriage return
+						await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
+							params={
+								'type': 'char',
+								'text': '\r',
+								'key': 'Enter',
+							},
+							session_id=cdp_session.session_id,
+						)
+
+						# Send keyUp event
+						await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
+							params={
+								'type': 'keyUp',
+								'key': 'Enter',
+								'code': 'Enter',
+								'windowsVirtualKeyCode': 13,
+							},
+							session_id=cdp_session.session_id,
+						)
+					else:
+						# Handle regular characters
+						# Get proper modifiers, VK code, and base key for the character
+						modifiers, vk_code, base_key = self._get_char_modifiers_and_vk(char)
+						key_code = self._get_key_code_for_char(base_key)
+
+						# self.logger.debug(f'🎯 Typing character {i + 1}/{len(text)}: "{char}" (base_key: {base_key}, code: {key_code}, modifiers: {modifiers}, vk: {vk_code})')
+
+						# Step 1: Send keyDown event (NO text parameter)
+						await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
+							params={
+								'type': 'keyDown',
+								'key': base_key,
+								'code': key_code,
+								'modifiers': modifiers,
+								'windowsVirtualKeyCode': vk_code,
+							},
+							session_id=cdp_session.session_id,
+						)
+
+						# Small delay to emulate human typing speed
+						await asyncio.sleep(0.005)
+
+						# Step 2: Send char event (WITH text parameter) - this is crucial for text input
+						await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
+							params={
+								'type': 'char',
+								'text': char,
+								'key': char,
+							},
+							session_id=cdp_session.session_id,
+						)
+
+						# Step 3: Send keyUp event (NO text parameter)
+						await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
+							params={
+								'type': 'keyUp',
+								'key': base_key,
+								'code': key_code,
+								'modifiers': modifiers,
+								'windowsVirtualKeyCode': vk_code,
+							},
+							session_id=cdp_session.session_id,
+						)
+
+					# Small delay between characters to look human (realistic typing speed)
 					await asyncio.sleep(0.001)
 
-					# Send char event with carriage return
-					await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
-						params={
-							'type': 'char',
-							'text': '\r',
-							'key': 'Enter',
-						},
-						session_id=cdp_session.session_id,
-					)
-
-					# Send keyUp event
-					await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
-						params={
-							'type': 'keyUp',
-							'key': 'Enter',
-							'code': 'Enter',
-							'windowsVirtualKeyCode': 13,
-						},
-						session_id=cdp_session.session_id,
-					)
-				else:
-					# Handle regular characters
-					# Get proper modifiers, VK code, and base key for the character
-					modifiers, vk_code, base_key = self._get_char_modifiers_and_vk(char)
-					key_code = self._get_key_code_for_char(base_key)
-
-					# self.logger.debug(f'🎯 Typing character {i + 1}/{len(text)}: "{char}" (base_key: {base_key}, code: {key_code}, modifiers: {modifiers}, vk: {vk_code})')
-
-					# Step 1: Send keyDown event (NO text parameter)
-					await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
-						params={
-							'type': 'keyDown',
-							'key': base_key,
-							'code': key_code,
-							'modifiers': modifiers,
-							'windowsVirtualKeyCode': vk_code,
-						},
-						session_id=cdp_session.session_id,
-					)
-
-					# Small delay to emulate human typing speed
-					await asyncio.sleep(0.005)
-
-					# Step 2: Send char event (WITH text parameter) - this is crucial for text input
-					await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
-						params={
-							'type': 'char',
-							'text': char,
-							'key': char,
-						},
-						session_id=cdp_session.session_id,
-					)
-
-					# Step 3: Send keyUp event (NO text parameter)
-					await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
-						params={
-							'type': 'keyUp',
-							'key': base_key,
-							'code': key_code,
-							'modifiers': modifiers,
-							'windowsVirtualKeyCode': vk_code,
-						},
-						session_id=cdp_session.session_id,
-					)
-
-				# Small delay between characters to look human (realistic typing speed)
-				await asyncio.sleep(0.001)
-
-			# Step 4: Trigger framework-aware DOM events after typing completion
+			# Step 5: Trigger framework-aware DOM events after typing completion
 			# Modern JavaScript frameworks (React, Vue, Angular) rely on these events
 			# to update their internal state and trigger re-renders
 			await self._trigger_framework_events(object_id=object_id, cdp_session=cdp_session)
 
-			# Step 5: Verify that the text was actually entered into the field
+			# Step 6: Verify that the text was actually entered into the field
 			# This is CRITICAL for detecting cases where input fails silently
 			# (e.g., field is disabled, wrong field targeted, text gets cleared by validation)
 			# RETURN the actual field state so it can be included in ActionResult.extracted_content
@@ -1596,12 +1633,36 @@ class DefaultActionWatchdog(BaseWatchdog):
 				# Non-critical: if verification fails, log but don't fail the action
 				self.logger.debug(f'Could not verify input field value (non-critical): {verify_error}')
 
-			# Return coordinates metadata PLUS actual field state
+			# Check for console errors that occurred during this interaction
+			console_errors = None
+			console_validation_errors = None
+			if hasattr(self.browser_session, '_console_watchdog') and self.browser_session._console_watchdog and console_start_timestamp:
+				# Get messages that occurred after interaction started
+				messages_during_interaction = self.browser_session._console_watchdog.get_all_messages(
+					since_timestamp=console_start_timestamp
+				)
+
+				# Filter errors and validation errors
+				errors = [msg for msg in messages_during_interaction if msg['type'] == 'error']
+				validation_errs = [msg for msg in messages_during_interaction if msg.get('is_validation_error', False)]
+
+				if errors:
+					# Truncate for token efficiency
+					console_errors = [e['text'][:150] for e in errors[:3]]
+					self.logger.warning(f'⚠️ Console errors during input: {console_errors}')
+
+				if validation_errs:
+					console_validation_errors = [e['text'][:150] for e in validation_errs[:3]]
+					self.logger.warning(f'📝 Console validation errors: {console_validation_errors}')
+
+			# Return coordinates metadata PLUS actual field state AND console errors
 			# This allows the action handler to include actual results in extracted_content
 			result_metadata = input_coordinates or {}
 			result_metadata['actual_field_value'] = actual_field_value
 			result_metadata['field_validation_errors'] = field_validation_errors
 			result_metadata['field_verification_passed'] = field_verification_passed
+			result_metadata['console_errors'] = console_errors
+			result_metadata['console_validation_errors'] = console_validation_errors
 			return result_metadata
 
 		except Exception as e:
@@ -2602,6 +2663,68 @@ class DefaultActionWatchdog(BaseWatchdog):
 				function(targetText) {
 					const startElement = this;
 
+					// Enhanced fuzzy matching function
+					function findBestMatch(target, options, getText, getValue) {
+						const targetLower = target.toLowerCase().trim();
+						
+						// 1. Exact match (case-insensitive)
+						for (const opt of options) {
+							const text = getText(opt).toLowerCase().trim();
+							const value = getValue(opt).toLowerCase().trim();
+							if (text === targetLower || value === targetLower) {
+								return { option: opt, matchType: 'exact' };
+							}
+						}
+						
+						// 2. Starts with match
+						for (const opt of options) {
+							const text = getText(opt).toLowerCase().trim();
+							const value = getValue(opt).toLowerCase().trim();
+							if (text.startsWith(targetLower) || value.startsWith(targetLower)) {
+								return { option: opt, matchType: 'starts_with' };
+							}
+						}
+						
+						// 3. Contains match
+						for (const opt of options) {
+							const text = getText(opt).toLowerCase().trim();
+							const value = getValue(opt).toLowerCase().trim();
+							if (text.includes(targetLower) || value.includes(targetLower)) {
+								return { option: opt, matchType: 'contains' };
+							}
+						}
+						
+						// 4. Fuzzy match (simple edit distance - max 3 edits)
+						let bestMatch = null;
+						let bestScore = Infinity;
+						
+						function simpleEditDistance(s1, s2) {
+							if (!s1) return s2.length;
+							if (!s2) return s1.length;
+							if (s1[0] === s2[0]) return simpleEditDistance(s1.slice(1), s2.slice(1));
+							return 1 + Math.min(
+								simpleEditDistance(s1.slice(1), s2),
+								simpleEditDistance(s1, s2.slice(1)),
+								simpleEditDistance(s1.slice(1), s2.slice(1))
+							);
+						}
+						
+						for (const opt of options) {
+							const text = getText(opt).toLowerCase().trim();
+							const value = getValue(opt).toLowerCase().trim();
+							const textScore = simpleEditDistance(targetLower, text);
+							const valueScore = simpleEditDistance(targetLower, value);
+							const score = Math.min(textScore, valueScore);
+							
+							if (score < bestScore && score <= 3) {  // Max 3 edits for fuzzy match
+								bestScore = score;
+								bestMatch = { option: opt, matchType: 'fuzzy', score: score };
+							}
+						}
+						
+						return bestMatch;
+					}
+
 					// Function to attempt selection on a dropdown element
 					function attemptSelection(element) {
 						// Handle native select elements
@@ -2609,38 +2732,43 @@ class DefaultActionWatchdog(BaseWatchdog):
 							const options = Array.from(element.options);
 							const targetTextLower = targetText.toLowerCase();
 
-							for (const option of options) {
-								const optionTextLower = option.text.trim().toLowerCase();
-								const optionValueLower = option.value.toLowerCase();
+							// Use enhanced fuzzy matching
+							const match = findBestMatch(
+								targetText,
+								options,
+								opt => opt.text.trim(),
+								opt => opt.value
+							);
 
-								// Match against both text and value (case-insensitive)
-								if (optionTextLower === targetTextLower || optionValueLower === targetTextLower) {
-									// Focus the element FIRST (important for Svelte/Vue/React and other reactive frameworks)
-									// This simulates the user focusing on the dropdown before changing it
-									element.focus();
+							if (match) {
+								const option = match.option;
+								// Focus the element FIRST (important for Svelte/Vue/React and other reactive frameworks)
+								// This simulates the user focusing on the dropdown before changing it
+								element.focus();
 
-									// Then set the value
-									element.value = option.value;
-									option.selected = true;
+								// Then set the value
+								element.value = option.value;
+								option.selected = true;
 
-									// Trigger all necessary events for reactive frameworks
-									// 1. input event - critical for Vue's v-model and Svelte's bind:value
-									const inputEvent = new Event('input', { bubbles: true, cancelable: true });
-									element.dispatchEvent(inputEvent);
+								// Trigger all necessary events for reactive frameworks
+								// 1. input event - critical for Vue's v-model and Svelte's bind:value
+								const inputEvent = new Event('input', { bubbles: true, cancelable: true });
+								element.dispatchEvent(inputEvent);
 
-									// 2. change event - traditional form validation and framework reactivity
-									const changeEvent = new Event('change', { bubbles: true, cancelable: true });
-									element.dispatchEvent(changeEvent);
+								// 2. change event - traditional form validation and framework reactivity
+								const changeEvent = new Event('change', { bubbles: true, cancelable: true });
+								element.dispatchEvent(changeEvent);
 
-									// 3. blur event - completes the interaction, triggers validation
-									element.blur();
+								// 3. blur event - completes the interaction, triggers validation
+								element.blur();
 
-									return {
-										success: true,
-										message: `Selected option: ${option.text.trim()} (value: ${option.value})`,
-										value: option.value
-									};
-								}
+								const matchTypeStr = match.matchType === 'exact' ? '' : ` (${match.matchType} match)`;
+								return {
+									success: true,
+									message: `Selected option: ${option.text.trim()} (value: ${option.value})${matchTypeStr}`,
+									value: option.value,
+									matchType: match.matchType
+								};
 							}
 
 							// Return available options as separate field
@@ -2698,6 +2826,41 @@ class DefaultActionWatchdog(BaseWatchdog):
 								attempts++;
 							}
 							
+							// Use fuzzy matching for ARIA dropdowns
+							if (menuItems.length > 0) {
+								const match = findBestMatch(
+									targetText,
+									Array.from(menuItems),
+									item => item.textContent ? item.textContent.trim() : '',
+									item => item.getAttribute('data-value') || ''
+								);
+								
+								if (match) {
+									const item = match.option;
+									// Clear previous selections
+									menuItems.forEach(mi => {
+										mi.setAttribute('aria-selected', 'false');
+										mi.classList.remove('selected');
+									});
+
+									// Select this item
+									item.setAttribute('aria-selected', 'true');
+									item.classList.add('selected');
+
+									// Trigger click and change events
+									item.click();
+									const clickEvent = new MouseEvent('click', { view: window, bubbles: true, cancelable: true });
+									item.dispatchEvent(clickEvent);
+
+									const matchTypeStr = match.matchType === 'exact' ? '' : ` (${match.matchType} match)`;
+									return {
+										success: true,
+										message: `Selected ARIA menu item: ${item.textContent.trim()}${matchTypeStr}`,
+										matchType: match.matchType
+									};
+								}
+							}
+							
 							const targetTextLower = targetText.toLowerCase();
 							
 							// If still no options found and it's a combobox, try searching in parent/sibling elements
@@ -2708,34 +2871,37 @@ class DefaultActionWatchdog(BaseWatchdog):
 								if (parent) {
 									const parentMenuItems = parent.querySelectorAll('[role="menuitem"], [role="option"]');
 									if (parentMenuItems.length > 0) {
-										// Use parent's menu items
-										for (const item of parentMenuItems) {
-											if (item.textContent) {
-												const itemTextLower = item.textContent.trim().toLowerCase();
-												const itemValueLower = (item.getAttribute('data-value') || '').toLowerCase();
+										// Use fuzzy matching for parent menu items
+										const match = findBestMatch(
+											targetText,
+											Array.from(parentMenuItems),
+											item => item.textContent ? item.textContent.trim() : '',
+											item => item.getAttribute('data-value') || ''
+										);
+										
+										if (match) {
+											const item = match.option;
+											// Clear previous selections
+											parentMenuItems.forEach(mi => {
+												mi.setAttribute('aria-selected', 'false');
+												mi.classList.remove('selected');
+											});
 
-												if (itemTextLower === targetTextLower || itemValueLower === targetTextLower) {
-													// Clear previous selections
-													parentMenuItems.forEach(mi => {
-														mi.setAttribute('aria-selected', 'false');
-														mi.classList.remove('selected');
-													});
+											// Select this item
+											item.setAttribute('aria-selected', 'true');
+											item.classList.add('selected');
 
-													// Select this item
-													item.setAttribute('aria-selected', 'true');
-													item.classList.add('selected');
+											// Trigger click and change events
+											item.click();
+											const clickEvent = new MouseEvent('click', { view: window, bubbles: true, cancelable: true });
+											item.dispatchEvent(clickEvent);
 
-													// Trigger click and change events
-													item.click();
-													const clickEvent = new MouseEvent('click', { view: window, bubbles: true, cancelable: true });
-													item.dispatchEvent(clickEvent);
-
-													return {
-														success: true,
-														message: `Selected ARIA menu item: ${item.textContent.trim()}`
-													};
-												}
-											}
+											const matchTypeStr = match.matchType === 'exact' ? '' : ` (${match.matchType} match)`;
+											return {
+												success: true,
+												message: `Selected ARIA menu item: ${item.textContent.trim()}${matchTypeStr}`,
+												matchType: match.matchType
+											};
 										}
 									}
 								}
@@ -2743,46 +2909,18 @@ class DefaultActionWatchdog(BaseWatchdog):
 								// Also try searching in document body (some frameworks render options at body level)
 								const bodyMenuItems = document.body.querySelectorAll('[role="menuitem"], [role="option"]');
 								if (bodyMenuItems.length > 0) {
-									for (const item of bodyMenuItems) {
-										if (item.textContent) {
-											const itemTextLower = item.textContent.trim().toLowerCase();
-											const itemValueLower = (item.getAttribute('data-value') || '').toLowerCase();
-
-											if (itemTextLower === targetTextLower || itemValueLower === targetTextLower) {
-												// Clear previous selections
-												bodyMenuItems.forEach(mi => {
-													mi.setAttribute('aria-selected', 'false');
-													mi.classList.remove('selected');
-												});
-
-												// Select this item
-												item.setAttribute('aria-selected', 'true');
-												item.classList.add('selected');
-
-												// Trigger click and change events
-												item.click();
-												const clickEvent = new MouseEvent('click', { view: window, bubbles: true, cancelable: true });
-												item.dispatchEvent(clickEvent);
-
-												return {
-													success: true,
-													message: `Selected ARIA menu item: ${item.textContent.trim()}`
-												};
-											}
-										}
-									}
-								}
-							}
-
-							for (const item of menuItems) {
-								if (item.textContent) {
-									const itemTextLower = item.textContent.trim().toLowerCase();
-									const itemValueLower = (item.getAttribute('data-value') || '').toLowerCase();
-
-									// Match against both text and data-value (case-insensitive)
-									if (itemTextLower === targetTextLower || itemValueLower === targetTextLower) {
+									// Use fuzzy matching for body menu items
+									const match = findBestMatch(
+										targetText,
+										Array.from(bodyMenuItems),
+										item => item.textContent ? item.textContent.trim() : '',
+										item => item.getAttribute('data-value') || ''
+									);
+									
+									if (match) {
+										const item = match.option;
 										// Clear previous selections
-										menuItems.forEach(mi => {
+										bodyMenuItems.forEach(mi => {
 											mi.setAttribute('aria-selected', 'false');
 											mi.classList.remove('selected');
 										});
@@ -2796,9 +2934,11 @@ class DefaultActionWatchdog(BaseWatchdog):
 										const clickEvent = new MouseEvent('click', { view: window, bubbles: true, cancelable: true });
 										item.dispatchEvent(clickEvent);
 
+										const matchTypeStr = match.matchType === 'exact' ? '' : ` (${match.matchType} match)`;
 										return {
 											success: true,
-											message: `Selected ARIA menu item: ${item.textContent.trim()}`
+											message: `Selected ARIA menu item: ${item.textContent.trim()}${matchTypeStr}`,
+											matchType: match.matchType
 										};
 									}
 								}

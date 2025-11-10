@@ -1298,6 +1298,8 @@ class BrowserSession(BaseModel):
 		from qa_agent.browser.watchdogs.dom_watchdog import DOMWatchdog
 		from qa_agent.browser.watchdogs.downloads_watchdog import DownloadsWatchdog
 		from qa_agent.browser.watchdogs.local_browser_watchdog import LocalBrowserWatchdog
+		from qa_agent.browser.watchdogs.page_lifecycle_watchdog import PageLifecycleWatchdog
+		from qa_agent.browser.watchdogs.console_watchdog import ConsoleWatchdog
 		from qa_agent.browser.watchdogs.permissions_watchdog import PermissionsWatchdog
 		from qa_agent.browser.watchdogs.popups_watchdog import PopupsWatchdog
 		from qa_agent.browser.watchdogs.recording_watchdog import RecordingWatchdog
@@ -1376,6 +1378,16 @@ class BrowserSession(BaseModel):
 		# self.event_bus.on(TabCreatedEvent, self._popups_watchdog.on_TabCreatedEvent)
 		# self.event_bus.on(DialogCloseEvent, self._popups_watchdog.on_DialogCloseEvent)
 		self._popups_watchdog.attach_to_session()
+
+		# Initialize PageLifecycleWatchdog
+		PageLifecycleWatchdog.model_rebuild()
+		self._page_lifecycle_watchdog = PageLifecycleWatchdog(event_bus=self.event_bus, browser_session=self)
+		self._page_lifecycle_watchdog.attach_to_session()
+
+		# Initialize ConsoleWatchdog (monitors console errors, warnings, and validation errors for LLM visibility)
+		ConsoleWatchdog.model_rebuild()
+		self._console_watchdog = ConsoleWatchdog(event_bus=self.event_bus, browser_session=self)
+		self._console_watchdog.attach_to_session()
 
 		# Initialize PermissionsWatchdog (handles granting and revoking browser permissions like clipboard, microphone, camera, etc.)
 		PermissionsWatchdog.model_rebuild()
@@ -3223,3 +3235,45 @@ class BrowserSession(BaseModel):
 			'width': max(content[0], content[2], content[4], content[6]) - min(content[0], content[2], content[4], content[6]),
 			'height': max(content[1], content[3], content[5], content[7]) - min(content[1], content[3], content[5], content[7]),
 		}
+
+	async def wait_for_lifecycle_state(
+		self,
+		target_state: str = 'networkIdle',
+		timeout: float = 30.0
+	) -> bool:
+		"""
+		Wait for page to reach specific lifecycle state.
+
+		Lifecycle states: init, loading, DOMContentLoaded, load, networkIdle, networkAlmostIdle
+
+		Args:
+			target_state: Lifecycle state to wait for
+			timeout: Maximum wait time in seconds
+
+		Returns:
+			True if state reached, False if timeout
+		"""
+		# Check current state
+		if hasattr(self, '_lifecycle_states'):
+			current_frame_id = self.current_target_id
+			if current_frame_id in self._lifecycle_states:
+				if self._lifecycle_states[current_frame_id] == target_state:
+					return True
+
+		# Wait for state change with timeout
+		start_time = asyncio.get_event_loop().time()
+
+		# Register waiter
+		if not hasattr(self, '_lifecycle_waiters'):
+			self._lifecycle_waiters = {}
+
+		future = asyncio.Future()
+		self._lifecycle_waiters[target_state] = future
+
+		try:
+			await asyncio.wait_for(future, timeout=timeout)
+			return True
+		except asyncio.TimeoutError:
+			return False
+		finally:
+			self._lifecycle_waiters.pop(target_state, None)
