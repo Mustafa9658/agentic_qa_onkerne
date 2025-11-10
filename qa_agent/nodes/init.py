@@ -145,6 +145,19 @@ async def init_node(state: QAAgentState) -> Dict[str, Any]:
 	except Exception as e:
 		logger.debug(f"Could not get initial tab count: {e}")
 
+	# Initialize ScreenshotService for judge evaluation and GIF generation
+	screenshot_service = None
+	try:
+		from qa_agent.screenshots.service import ScreenshotService
+		from pathlib import Path
+
+		# Create agent directory for screenshots
+		agent_dir = Path("agent_outputs") / f"session_{session_id[:8]}"
+		screenshot_service = ScreenshotService(agent_directory=agent_dir)
+		logger.info(f"INIT: ScreenshotService initialized at {agent_dir}")
+	except Exception as e:
+		logger.warning(f"INIT: Failed to initialize ScreenshotService (non-critical): {e}")
+
 	# CRITICAL: Compulsory LLM-driven todo.md creation (browser-use style but mandatory)
 	# Use LLM to dynamically parse task and create todo.md structure
 	# No hardcoded keywords - LLM intelligently breaks down any task
@@ -251,4 +264,5 @@ async def init_node(state: QAAgentState) -> Dict[str, Any]:
 		"tab_count": tab_count,  # Track tab count for new tab detection
 		"previous_tabs": previous_tabs,  # Track tab IDs for comparison after actions
 		"file_system_state": file_system_state,  # Persist todo.md across nodes
+		"screenshot_service": screenshot_service,  # For judge evaluation and GIF generation
 	}
