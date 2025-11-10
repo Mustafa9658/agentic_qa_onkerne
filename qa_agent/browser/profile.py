@@ -276,7 +276,7 @@ class BrowserChannel(str, Enum):
 	MSEDGE_CANARY = 'msedge-canary'
 
 
-# Using constants from central location in browser_use.config
+# Using constants from central location in qa_agent.config
 BROWSERUSE_DEFAULT_CHANNEL = BrowserChannel.CHROMIUM
 
 
@@ -585,7 +585,7 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 	# New consolidated proxy config (typed)
 	proxy: ProxySettings | None = Field(
 		default=None,
-		description='Proxy settings. Use browser_use.browser.profile.ProxySettings(server, bypass, username, password)',
+		description='Proxy settings. Use qa_agent.browser.profile.ProxySettings(server, bypass, username, password)',
 	)
 	enable_default_extensions: bool = Field(
 		default=True,

@@ -92,7 +92,11 @@ class QAAgentState(TypedDict):
     # ========== Completion ==========
     completed: bool  # Task completion flag
     report: Optional[Dict[str, Any]]  # Final report
-    
+
+    # ========== Judge & GIF Settings ==========
+    use_judge: bool  # Enable LLM judge evaluation (default: True)
+    generate_gif: bool | str  # Enable GIF generation or specify output path (default: False)
+
     # ========== Read State (Extract Results) ==========
     read_state_description: Optional[str]  # Extract() results (one-time display)
     read_state_images: Optional[List[Dict[str, Any]]]  # Images from read_file
@@ -103,23 +107,28 @@ def create_initial_state(
     start_url: Optional[str] = None,
     max_steps: Optional[int] = None,
     max_failures: Optional[int] = None,
+    use_judge: bool = True,
+    generate_gif: bool | str = False,
 ) -> QAAgentState:
     """
     Create initial QA agent state
-    
+
     Args:
         task: User task description
         start_url: Optional initial URL to navigate to
         max_steps: Maximum steps allowed (defaults to settings.max_steps)
         max_failures: Maximum consecutive failures (defaults to settings.max_failures)
-        
+        use_judge: Enable LLM judge evaluation (default: True)
+        generate_gif: Enable GIF generation or specify output path (default: False)
+
     Returns:
         Initial QAAgentState dictionary
-        
+
     Note:
         - No hardcoded values - all come from parameters or settings
         - LangGraph reducers handle accumulation automatically
         - FileSystem state initialized as None (created in think_node)
+        - Judge and GIF features are opt-in/opt-out via parameters
     """
     # Use settings defaults if not provided (no hardcoded values)
     max_steps = max_steps if max_steps is not None else settings.max_steps
@@ -191,7 +200,11 @@ def create_initial_state(
         # Completion
         "completed": False,
         "report": None,
-        
+
+        # Judge & GIF
+        "use_judge": use_judge,  # Enable judge evaluation
+        "generate_gif": generate_gif,  # Enable GIF or specify path
+
         # Read state
         "read_state_description": None,
         "read_state_images": None,

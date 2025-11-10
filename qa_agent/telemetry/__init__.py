@@ -16,11 +16,11 @@ if TYPE_CHECKING:
 
 # Lazy imports mapping
 _LAZY_IMPORTS = {
-	'ProductTelemetry': ('browser_use.telemetry.service', 'ProductTelemetry'),
-	'BaseTelemetryEvent': ('browser_use.telemetry.views', 'BaseTelemetryEvent'),
-	'CLITelemetryEvent': ('browser_use.telemetry.views', 'CLITelemetryEvent'),
-	'MCPClientTelemetryEvent': ('browser_use.telemetry.views', 'MCPClientTelemetryEvent'),
-	'MCPServerTelemetryEvent': ('browser_use.telemetry.views', 'MCPServerTelemetryEvent'),
+	'ProductTelemetry': ('qa_agent.telemetry.service', 'ProductTelemetry'),
+	'BaseTelemetryEvent': ('qa_agent.telemetry.views', 'BaseTelemetryEvent'),
+	'CLITelemetryEvent': ('qa_agent.telemetry.views', 'CLITelemetryEvent'),
+	'MCPClientTelemetryEvent': ('qa_agent.telemetry.views', 'MCPClientTelemetryEvent'),
+	'MCPServerTelemetryEvent': ('qa_agent.telemetry.views', 'MCPServerTelemetryEvent'),
 }
 
 

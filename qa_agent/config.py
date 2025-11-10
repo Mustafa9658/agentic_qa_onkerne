@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     ANONYMIZED_TELEMETRY: bool = False  # Disable telemetry
     BROWSER_USE_LOGGING_LEVEL: str = "INFO"  # Browser-use logging level
 
+    # GIF generation settings (cross-platform)
+    # Windows: C:/Windows/Fonts, Linux: /usr/share/fonts, macOS: /Library/Fonts
+    # The GIF module will auto-detect the correct path based on platform
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
