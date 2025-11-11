@@ -39,6 +39,9 @@ class QAAgentState(TypedDict):
     previous_url: Optional[str]  # Previous URL for change detection
     current_title: Optional[str]  # Current page title
     previous_element_count: Optional[int]  # Previous element count for change detection
+    previous_element_ids: Optional[List[int]]  # Phase 1 & 2: Previous element IDs for adaptive detection
+    action_context: Optional[Dict[str, Any]]  # Phase 1: Action → element relationship context
+    new_element_ids: Optional[List[int]]  # Phase 1: New elements that appeared after last action
     
     # ========== Tab Management ==========
     tab_count: int  # Number of open tabs
@@ -153,6 +156,9 @@ def create_initial_state(
         "previous_url": None,
         "current_title": None,
         "previous_element_count": None,
+        "previous_element_ids": None,  # Phase 1 & 2: Track element IDs for adaptive detection
+        "action_context": None,  # Phase 1: Action → element relationship
+        "new_element_ids": None,  # Phase 1: New elements after actions
         
         # Tab management
         "tab_count": 1,  # Start with 1 tab

@@ -116,3 +116,13 @@ class SequentialFormFillAction(BaseModel):
 	field_values: dict[str, str] = Field(
 		description='Dictionary mapping field names/ids to values. Example: {"email": "user@example.com", "password": "secret123"}'
 	)
+	
+	@classmethod
+	def model_json_schema(cls, **kwargs):
+		"""Override schema generation to ensure OpenAI structured output compatibility"""
+		schema = super().model_json_schema(**kwargs)
+		# Ensure required array exactly matches properties keys for OpenAI compatibility
+		if 'properties' in schema and 'required' in schema:
+			# Only include keys that actually exist in properties
+			schema['required'] = [key for key in schema['required'] if key in schema['properties']]
+		return schema

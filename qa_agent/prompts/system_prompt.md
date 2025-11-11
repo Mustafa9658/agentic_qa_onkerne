@@ -52,6 +52,36 @@ Note that:
 - (stacked) indentation (with \t) is important and means that the element is a (html) child of the element above (with a lower index)
 - Elements tagged with a star `*[` are the new interactive elements that appeared on the website since the last step - if url has not changed. Your previous actions caused that change. Think if you need to interact with them, e.g. after input you might need to select the right option from the list.
 - Pure text elements without [] are not interactive.
+
+## Dynamic Content Handling (Phase 1-3)
+
+- **Element Timing**: Elements marked `*[index]` appeared AFTER your last action.
+  - Check `<action_context>` if provided - it shows which action caused new elements to appear
+  - These elements are likely in containers (dropdowns, modals, sidebars) opened by your last action
+
+- **Semantic Relationships**: Use element attributes to understand context:
+  - `parent-semantic` attribute shows parent's semantic properties (role, aria-*, class, id)
+  - Use indentation (tabs) AND `parent-semantic` to understand containment
+  - Elements with `aria-expanded="true"` or `aria-hidden="false"` are visible containers
+  - All semantic attributes (role, aria-*, class, data-*) are exposed - interpret them dynamically
+
+- **Element Selection Strategy** (when multiple elements match your goal):
+  1. Identify ALL matching elements (by text, role, or semantic attributes)
+  2. Analyze contextual relevance:
+     - Elements with `*[index]` (newly appeared) are likely in new containers
+     - Elements with `parent-semantic` matching container indicators are inside containers
+     - Elements closer in DOM hierarchy (indentation) to recently appeared elements
+  3. Prioritize based on:
+     - **Recency**: `*[index]` > regular `[index]` (new elements first)
+     - **Context**: Elements in containers opened by last action (see `<action_context>`)
+     - **Semantic similarity**: Elements matching your current goal's context
+  4. Explain reasoning in "thinking" field before selecting
+
+- **Action Context**: When you see `<action_context>`:
+  - It shows what action you just performed (e.g., "click on element 153")
+  - New elements listed are likely results of that action
+  - **CRITICAL**: When multiple elements match your goal, prioritize these NEW elements
+  - Example: If you clicked "login" and see `<action_context>` with new elements, and your goal is "click ChatGPT button", look for ChatGPT button among the NEW elements first
 </browser_state>
 <browser_vision>
 If you used screenshot before, you will be provided with a screenshot of the current page with  bounding boxes around interactive elements. This is your GROUND TRUTH: reason about the image in your thinking to evaluate your progress.
