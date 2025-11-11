@@ -578,7 +578,11 @@ class Element:
 
 	async def check(self, force_state: bool | None = None) -> None:
 		"""
-		Check or uncheck a checkbox/radio button.
+		Check or uncheck a checkbox/radio button using multiple strategies.
+		
+		Based on research: Some checkboxes are state-controlled and need click events,
+		others can be set directly. We try click() first (most reliable), then fallback
+		to direct property setting if needed.
 		
 		Args:
 			force_state: True to check, False to uncheck, None to toggle
@@ -591,7 +595,7 @@ class Element:
 		if is_indeterminate:
 			logger.debug('Checkbox is in indeterminate state, clicking to resolve')
 			await self.click()
-			await asyncio.sleep(0.1)
+			await asyncio.sleep(0.15)  # Slightly longer wait for state-controlled checkboxes
 			# Re-check state after click
 			current_state = await self.get_checkbox_state()
 			is_checked = current_state['checked']
@@ -603,15 +607,74 @@ class Element:
 		else:
 			target_state = force_state
 		
-		# Only click if state needs to change
+		# Only interact if state needs to change
 		if is_checked != target_state:
-			await self.click()
+			# Strategy 1: Use click() method (works for state-controlled checkboxes)
+			# Research shows click() is more reliable for checkboxes with onClick handlers
+			try:
+				await self.click()
+				# Wait longer for state-controlled checkboxes to update
+				await asyncio.sleep(0.2)  # Increased from 0.1 for state-controlled checkboxes
+				
+				# Verify state changed
+				new_state = await self.get_checkbox_state()
+				if new_state['checked'] == target_state:
+					logger.debug(f'Checkbox state changed successfully via click: {is_checked} -> {target_state}')
+					return
+				else:
+					logger.debug(f'Click did not change state as expected: {is_checked} -> {new_state["checked"]} (expected {target_state})')
+			except Exception as click_error:
+				logger.debug(f'Click method failed: {click_error}, trying direct property setting')
 			
-			# Verify state changed
-			await asyncio.sleep(0.1)
-			new_state = await self.get_checkbox_state()
-			if new_state['checked'] != target_state:
-				raise RuntimeError(f'Failed to set checkbox state: expected {target_state}, got {new_state["checked"]}')
+			# Strategy 2: Direct property setting (fallback for non-state-controlled checkboxes)
+			# This works for standard checkboxes that don't rely on click events
+			try:
+				node_id = await self._get_node_id()
+				result = await self._client.send.DOM.resolveNode(
+					params={'nodeId': node_id},
+					session_id=self._session_id
+				)
+				object_id = result['object']['objectId']
+				
+				# Set checked property directly and trigger events
+				await self._client.send.Runtime.callFunctionOn(
+					params={
+						'functionDeclaration': f'''
+							function() {{
+								this.checked = {str(target_state).lower()};
+								// Trigger events for framework compatibility (React, Vue, etc.)
+								this.dispatchEvent(new Event("change", {{ bubbles: true }}));
+								this.dispatchEvent(new Event("input", {{ bubbles: true }}));
+								// For ARIA checkboxes
+								if (this.setAttribute) {{
+									this.setAttribute("aria-checked", "{str(target_state).lower()}");
+								}}
+								return this.checked;
+							}}
+						''',
+						'objectId': object_id,
+						'returnByValue': True
+					},
+					session_id=self._session_id
+				)
+				
+				await asyncio.sleep(0.1)
+				
+				# Verify state changed
+				new_state = await self.get_checkbox_state()
+				if new_state['checked'] == target_state:
+					logger.debug(f'Checkbox state changed successfully via direct property: {is_checked} -> {target_state}')
+					return
+				else:
+					raise RuntimeError(f'Direct property setting failed: expected {target_state}, got {new_state["checked"]}')
+			except Exception as prop_error:
+				logger.debug(f'Direct property setting failed: {prop_error}')
+				# If both strategies failed, raise error with context
+				raise RuntimeError(
+					f'Failed to set checkbox state: tried click() and direct property setting. '
+					f'Current state: {is_checked}, target: {target_state}. '
+					f'Last error: {prop_error}'
+				)
 		else:
 			logger.debug(f'Checkbox already in desired state: {is_checked}')
 
