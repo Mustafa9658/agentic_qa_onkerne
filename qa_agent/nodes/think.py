@@ -267,8 +267,10 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
 
             # Check if current goal appears complete based on page state (URL/title)
             # This detects major phase transitions (e.g., "now on dashboard")
+            current_url_str = current_url or ""
+            current_title_str = current_title or ""
             is_goal_complete = any(
-                signal.lower() in current_url.lower() or signal.lower() in current_title.lower()
+                signal.lower() in current_url_str.lower() or signal.lower() in current_title_str.lower()
                 for signal in completion_signals
             )
 
@@ -624,15 +626,42 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
                 # If todo.md parsing fails, just skip enhancement (don't break prompt)
                 logger.debug(f"Could not enhance task context with todo.md: {e}")
         
-        # Step 3: Merge with priority (todo.md first, then goals, then full task)
+        # Phase 1: Add action context if available (shows which action caused new elements)
+        action_context = state.get("action_context")
+        action_context_text = ""
+        if action_context:
+            action_type = action_context.get("action_type", "unknown")
+            action_index = action_context.get("action_index")
+            new_elements_count = action_context.get("new_elements_count", 0)
+            
+            if new_elements_count > 0:
+                action_context_text = f"\n<action_context>\n"
+                action_context_text += f"Last action: {action_type}"
+                if action_index:
+                    action_context_text += f" on element {action_index}"
+                action_context_text += f"\nNew elements appeared: {new_elements_count} elements (marked with *[index])\n"
+                action_context_text += f"These elements are likely in a container opened by your last action.\n"
+                action_context_text += f"When multiple elements match your goal, prioritize these NEW elements.\n"
+                action_context_text += f"</action_context>\n"
+                logger.info(f"📊 Adding action context: {action_type} → {new_elements_count} new elements")
+        
+        # Step 3: Merge with priority (todo.md first, then action context, then goals, then full task)
         if todo_context:
             # Priority: todo.md context (PRIMARY)
             enhanced_task = f"{todo_context}📋 FULL TASK (for reference):\n{task}"
+            if action_context_text:
+                # Add action context after todo (high priority for element selection)
+                enhanced_task = f"{todo_context}{action_context_text}📋 FULL TASK (for reference):\n{task}"
             if goal_context:
                 # Add goal hints as secondary information
                 enhanced_task += goal_context
+        elif action_context_text:
+            # Fallback: Action context if no todo.md
+            enhanced_task = f"{action_context_text}{task}"
+            if goal_context:
+                enhanced_task += goal_context
         elif goal_context:
-            # Fallback: Only goals if no todo.md
+            # Fallback: Only goals if no todo.md or action context
             enhanced_task = f"{task}{goal_context}"
         # else: enhanced_task = task (no enhancement)
 
@@ -753,7 +782,8 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         logger.info(f"Using dynamic ActionModel with {len([a for a in tools.registry.registry.actions.keys()])} registered actions")
 
         # LangChain uses with_structured_output() method, NOT output_format parameter
-        structured_llm = llm.with_structured_output(dynamic_agent_output)
+        # Use function_calling method for OpenAI compatibility with complex nested schemas
+        structured_llm = llm.with_structured_output(dynamic_agent_output, method="function_calling")
         parsed: AgentOutput = await structured_llm.ainvoke(langchain_messages)
 
         logger.info(f"LLM response received: {parsed}")

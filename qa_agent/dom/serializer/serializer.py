@@ -792,8 +792,17 @@ class DOMTreeSerializer:
 		return False
 
 	@staticmethod
-	def serialize_tree(node: SimplifiedNode | None, include_attributes: list[str], depth: int = 0) -> str:
-		"""Serialize the optimized tree to string format."""
+	def serialize_tree(
+		node: SimplifiedNode | None, 
+		include_attributes: list[str], 
+		depth: int = 0,
+		parent_node: SimplifiedNode | None = None,
+	) -> str:
+		"""
+		Serialize the optimized tree to string format.
+		
+		Phase 3: Enhanced with parent context for semantic relationship understanding.
+		"""
 		if not node:
 			return ''
 
@@ -801,7 +810,7 @@ class DOMTreeSerializer:
 		if hasattr(node, 'excluded_by_parent') and node.excluded_by_parent:
 			formatted_text = []
 			for child in node.children:
-				child_text = DOMTreeSerializer.serialize_tree(child, include_attributes, depth)
+				child_text = DOMTreeSerializer.serialize_tree(child, include_attributes, depth, node)
 				if child_text:
 					formatted_text.append(child_text)
 			return '\n'.join(formatted_text)
@@ -814,7 +823,7 @@ class DOMTreeSerializer:
 			# Skip displaying nodes marked as should_display=False
 			if not node.should_display:
 				for child in node.children:
-					child_text = DOMTreeSerializer.serialize_tree(child, include_attributes, depth)
+					child_text = DOMTreeSerializer.serialize_tree(child, include_attributes, depth, node)
 					if child_text:
 						formatted_text.append(child_text)
 				return '\n'.join(formatted_text)
@@ -837,7 +846,9 @@ class DOMTreeSerializer:
 					new_prefix = '*' if node.is_new else ''
 					line += f'{new_prefix}[{node.original_node.backend_node_id}]'
 				line += '<svg'
-				attributes_html_str = DOMTreeSerializer._build_attributes_string(node.original_node, include_attributes, '')
+				attributes_html_str = DOMTreeSerializer._build_attributes_string(
+					node.original_node, include_attributes, '', parent_node
+				)
 				if attributes_html_str:
 					line += f' {attributes_html_str}'
 				line += ' /> <!-- SVG content collapsed -->'
@@ -857,9 +868,10 @@ class DOMTreeSerializer:
 				next_depth += 1
 
 				# Build attributes string with compound component info
+				# Phase 3: Pass parent_node for semantic context
 				text_content = ''
 				attributes_html_str = DOMTreeSerializer._build_attributes_string(
-					node.original_node, include_attributes, text_content
+					node.original_node, include_attributes, text_content, parent_node
 				)
 
 				# Add compound component information to attributes if present
@@ -950,7 +962,7 @@ class DOMTreeSerializer:
 
 			# Process shadow DOM children
 			for child in node.children:
-				child_text = DOMTreeSerializer.serialize_tree(child, include_attributes, next_depth)
+				child_text = DOMTreeSerializer.serialize_tree(child, include_attributes, next_depth, node)
 				if child_text:
 					formatted_text.append(child_text)
 
@@ -973,26 +985,37 @@ class DOMTreeSerializer:
 		# Process children (for non-shadow elements)
 		if node.original_node.node_type != NodeType.DOCUMENT_FRAGMENT_NODE:
 			for child in node.children:
-				child_text = DOMTreeSerializer.serialize_tree(child, include_attributes, next_depth)
+				child_text = DOMTreeSerializer.serialize_tree(child, include_attributes, next_depth, node)
 				if child_text:
 					formatted_text.append(child_text)
 
 		return '\n'.join(formatted_text)
 
 	@staticmethod
-	def _build_attributes_string(node: EnhancedDOMTreeNode, include_attributes: list[str], text: str) -> str:
-		"""Build the attributes string for an element."""
+	def _build_attributes_string(
+		node: EnhancedDOMTreeNode, 
+		include_attributes: list[str], 
+		text: str,
+		parent_node: 'SimplifiedNode | None' = None,
+	) -> str:
+		"""
+		Build the attributes string for an element.
+		
+		Phase 3: Expose ALL semantic attributes (not filtered by include_attributes).
+		Let LLM interpret semantic meaning dynamically.
+		"""
 		attributes_to_include = {}
 
-		# Include HTML attributes
+		# Phase 3: Expose ALL HTML attributes (not filtered by include_attributes)
+		# Only skip empty values - let LLM interpret all semantic data
 		if node.attributes:
-			attributes_to_include.update(
-				{
-					key: str(value).strip()
-					for key, value in node.attributes.items()
-					if key in include_attributes and str(value).strip() != ''
-				}
-			)
+			for key, value in node.attributes.items():
+				value_str = str(value).strip()
+				if value_str:  # Only skip empty values
+					# Truncate very long values to prevent prompt bloat
+					if len(value_str) > 100:
+						value_str = value_str[:97] + "..."
+					attributes_to_include[key] = value_str
 
 		# Add format hints for date/time inputs to help LLMs use the correct format
 		# NOTE: These formats are standardized by HTML5 specification (ISO 8601), NOT locale-dependent
@@ -1143,20 +1166,44 @@ class DOMTreeSerializer:
 						existing_placeholder = attributes_to_include['placeholder']
 						attributes_to_include['placeholder'] = f'{existing_placeholder} ({detected_currency})'
 
-		# Include accessibility properties
+		# Phase 3: Expose ALL accessibility properties (not filtered by include_attributes)
+		# These provide crucial semantic information (role, aria-*, etc.)
 		if node.ax_node and node.ax_node.properties:
 			for prop in node.ax_node.properties:
 				try:
-					if prop.name in include_attributes and prop.value is not None:
+					if prop.value is not None:
 						# Convert boolean to lowercase string, keep others as-is
 						if isinstance(prop.value, bool):
 							attributes_to_include[prop.name] = str(prop.value).lower()
 						else:
 							prop_value_str = str(prop.value).strip()
 							if prop_value_str:
+								# Truncate very long values
+								if len(prop_value_str) > 100:
+									prop_value_str = prop_value_str[:97] + "..."
 								attributes_to_include[prop.name] = prop_value_str
 				except (AttributeError, ValueError):
 					continue
+		
+		# Phase 3: Add parent semantic context (expose parent's semantic attributes)
+		# This helps LLM understand element relationships without hardcoding container types
+		parent_context = []
+		if parent_node and parent_node.original_node and parent_node.original_node.attributes:
+			parent = parent_node.original_node
+			# Expose key semantic attributes from parent (let LLM interpret)
+			semantic_keys = ['role', 'aria-expanded', 'aria-hidden', 'aria-label', 'class', 'id']
+			for key in semantic_keys:
+				if key in parent.attributes:
+					value = str(parent.attributes[key]).strip()
+					if value:
+						# Truncate long values
+						if len(value) > 50:
+							value = value[:47] + "..."
+						parent_context.append(f"{key}={value}")
+		
+		# Add parent context as special attribute if available
+		if parent_context:
+			attributes_to_include['parent-semantic'] = "|".join(parent_context)
 
 		# Special handling for form elements - ensure current value is shown
 		# For text inputs, textareas, and selects, prioritize showing the current value from AX tree

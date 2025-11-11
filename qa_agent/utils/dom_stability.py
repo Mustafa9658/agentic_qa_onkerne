@@ -3,10 +3,12 @@ DOM Stability Utilities
 
 Helper functions to wait for network idle and DOM stability after actions.
 Based on browser-use's DOMWatchdog pattern.
+
+Enhanced with adaptive detection for dynamic content.
 """
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple, Set
 
 if TYPE_CHECKING:
     from qa_agent.browser.session import BrowserSession
@@ -78,6 +80,156 @@ async def wait_for_dom_stability(
     except Exception as e:
         logger.debug(f"Could not check network idle: {e}, proceeding with state refresh")
         # Don't fail - just proceed without waiting
+
+
+async def detect_dom_changes_adaptively(
+    browser_session: "BrowserSession",
+    previous_element_ids: Set[int] | None = None,
+    max_passes: int = 5,
+    stability_threshold: int = 2,
+    pass_interval: float = 0.3,
+) -> Tuple[Set[int], int]:
+    """
+    Detect DOM changes adaptively across multiple passes.
+    
+    Waits until element count stabilizes (same count for stability_threshold passes).
+    This ensures dropdowns, modals, and animated content are fully rendered.
+    
+    Args:
+        browser_session: Browser session to check
+        previous_element_ids: Set of element IDs from before action (None to detect from current state)
+        max_passes: Maximum number of passes to check (default 5)
+        stability_threshold: Number of consecutive passes with same count needed for stability (default 2)
+        pass_interval: Time between passes in seconds (default 0.3s)
+    
+    Returns:
+        Tuple of (final_element_ids, passes_taken)
+    """
+    element_counts = []
+    element_ids_history = []
+    
+    # Get initial state if previous_element_ids not provided
+    if previous_element_ids is None:
+        try:
+            initial_state = await browser_session.get_browser_state_summary(
+                include_screenshot=False, cached=False
+            )
+            previous_element_ids = set(
+                initial_state.dom_state.selector_map.keys() 
+                if initial_state.dom_state and initial_state.dom_state.selector_map 
+                else []
+            )
+        except Exception as e:
+            logger.debug(f"Could not get initial element IDs: {e}")
+            previous_element_ids = set()
+    
+    logger.info(f"🔍 Adaptive DOM change detection: Starting with {len(previous_element_ids)} elements")
+    
+    for pass_num in range(max_passes):
+        try:
+            state = await browser_session.get_browser_state_summary(
+                include_screenshot=False, cached=False
+            )
+            current_ids = set(
+                state.dom_state.selector_map.keys() 
+                if state.dom_state and state.dom_state.selector_map 
+                else []
+            )
+            element_counts.append(len(current_ids))
+            element_ids_history.append(current_ids)
+            
+            # Log change if detected
+            if pass_num > 0 and element_counts[-1] != element_counts[-2]:
+                change = element_counts[-1] - element_counts[-2]
+                logger.debug(f"   Pass {pass_num + 1}: {element_counts[-1]} elements ({change:+d})")
+            
+            # Check if count stabilized (same for stability_threshold passes)
+            if len(element_counts) >= stability_threshold:
+                recent_counts = element_counts[-stability_threshold:]
+                if len(set(recent_counts)) == 1:  # All same
+                    new_elements = current_ids - previous_element_ids
+                    logger.info(
+                        f"✅ DOM stabilized after {pass_num + 1} passes "
+                        f"({element_counts[-1]} elements, {len(new_elements)} new)"
+                    )
+                    return current_ids, pass_num + 1
+            
+            # Wait before next pass (except last pass)
+            if pass_num < max_passes - 1:
+                await asyncio.sleep(pass_interval)
+        
+        except Exception as e:
+            logger.debug(f"Error in pass {pass_num + 1}: {e}")
+            # Continue to next pass
+    
+    # Max passes reached - return final state
+    final_ids = element_ids_history[-1] if element_ids_history else previous_element_ids
+    new_elements = final_ids - previous_element_ids
+    logger.info(
+        f"⏱️ Max passes ({max_passes}) reached: {len(final_ids)} elements "
+        f"({len(new_elements)} new since start)"
+    )
+    return final_ids, max_passes
+
+
+async def get_adaptive_visibility_state(
+    browser_session: "BrowserSession",
+    max_passes: int = 3,
+    pass_interval: float = 0.3,
+) -> dict[int, bool]:
+    """
+    Check visibility across multiple passes to catch animated elements.
+    
+    Elements that appear gradually (via CSS animations, transitions) may not be
+    visible in the first pass. This function checks multiple times to catch them.
+    
+    Args:
+        browser_session: Browser session to check
+        max_passes: Number of passes to check (default 3)
+        pass_interval: Time between passes in seconds (default 0.3s)
+    
+    Returns:
+        Dictionary mapping backend_node_id to visibility (True if visible in ANY pass)
+    """
+    visibility_states = {}
+    
+    for pass_num in range(max_passes):
+        try:
+            state = await browser_session.get_browser_state_summary(
+                include_screenshot=False, cached=False
+            )
+            
+            if state.dom_state and state.dom_state.selector_map:
+                for node_id, node in state.dom_state.selector_map.items():
+                    is_visible = (
+                        node.is_visible 
+                        if hasattr(node, 'is_visible') 
+                        else False
+                    )
+                    
+                    if node_id not in visibility_states:
+                        visibility_states[node_id] = []
+                    visibility_states[node_id].append(is_visible)
+            
+            if pass_num < max_passes - 1:
+                await asyncio.sleep(pass_interval)
+        
+        except Exception as e:
+            logger.debug(f"Error in visibility pass {pass_num + 1}: {e}")
+    
+    # Element is visible if visible in ANY pass (catches animated elements)
+    final_visibility = {
+        node_id: any(visits) 
+        for node_id, visits in visibility_states.items()
+    }
+    
+    if max_passes > 1:
+        logger.debug(
+            f"Multi-pass visibility check: {len(final_visibility)} elements checked "
+            f"across {max_passes} passes"
+        )
+    
+    return final_visibility
 
 
 async def clear_cache_if_needed(
