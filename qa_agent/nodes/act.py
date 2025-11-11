@@ -475,6 +475,10 @@ def convert_to_action_model(action_dict: Dict[str, Any], ActionModelClass: type 
 		SearchAction,
 		WaitAction,
 		NoParamsAction,
+		CheckboxAction,
+		GetDropdownOptionsAction,
+		SelectDropdownOptionAction,
+		UploadFileAction,
 	)
 	
 	# Use provided ActionModel class or fallback to base
@@ -619,6 +623,88 @@ def convert_to_action_model(action_dict: Dict[str, Any], ActionModelClass: type 
 			from qa_agent.tools.views import NoParamsAction
 			# Go back uses NoParamsAction
 			return ActionModelClass(go_back=NoParamsAction())
+
+		elif action_type == "checkbox":
+			index = action_dict.get("index")
+			if index is None:
+				logger.warning(f"No index for checkbox action: {action_dict}")
+				return None
+			if index == 0:
+				logger.warning(f"Invalid index for checkbox action (must be > 0): {action_dict}")
+				return None
+			checked = action_dict.get("checked")
+			# checked can be True, False, or None (for toggle)
+			return ActionModelClass(checkbox=CheckboxAction(index=int(index), checked=checked))
+
+		elif action_type == "dropdown_options":
+			index = action_dict.get("index")
+			if index is None:
+				logger.warning(f"No index for dropdown_options action: {action_dict}")
+				return None
+			if index == 0:
+				logger.warning(f"Invalid index for dropdown_options action (must be > 0): {action_dict}")
+				return None
+			return ActionModelClass(dropdown_options=GetDropdownOptionsAction(index=int(index)))
+
+		elif action_type == "select_dropdown":
+			index = action_dict.get("index")
+			text = action_dict.get("text", "")
+			if index is None:
+				logger.warning(f"No index for select_dropdown action: {action_dict}")
+				return None
+			if index == 0:
+				logger.warning(f"Invalid index for select_dropdown action (must be > 0): {action_dict}")
+				return None
+			if not text:
+				logger.warning(f"No text for select_dropdown action: {action_dict}")
+				return None
+			return ActionModelClass(select_dropdown=SelectDropdownOptionAction(index=int(index), text=str(text)))
+
+		elif action_type == "close":
+			# "close" uses CloseTabAction (same as close_tab)
+			tab_id = action_dict.get("tab_id", "")
+			if not tab_id:
+				logger.warning(f"No tab_id for close action: {action_dict}")
+				return None
+			# Ensure tab_id is 4 characters
+			if len(str(tab_id)) > 4:
+				tab_id = str(tab_id)[-4:]
+			elif len(str(tab_id)) < 4:
+				logger.warning(f"Tab ID {tab_id} is less than 4 characters, may be invalid")
+			return ActionModelClass(close=CloseTabAction(tab_id=str(tab_id)[-4:] if tab_id else ""))
+
+		elif action_type == "upload_file":
+			index = action_dict.get("index")
+			path = action_dict.get("path", "")
+			if index is None:
+				logger.warning(f"No index for upload_file action: {action_dict}")
+				return None
+			if not path:
+				logger.warning(f"No path for upload_file action: {action_dict}")
+				return None
+			return ActionModelClass(upload_file=UploadFileAction(index=int(index), path=str(path)))
+
+		elif action_type in ["evaluate", "find_text", "read_file", "replace_file", "write_file"]:
+			# These actions use registry-created param models from function signatures
+			# Get param model from registry
+			if registry and action_type in registry.registry.actions:
+				action_info = registry.registry.actions[action_type]
+				param_model = action_info.param_model
+				
+				# Extract params from action_dict (excluding special params)
+				special_params = {"browser_session", "file_system", "available_file_paths", "page_extraction_llm"}
+				params_dict = {k: v for k, v in action_dict.items() if k not in special_params and k != "action"}
+				
+				try:
+					# Validate and create param instance
+					validated_params = param_model(**params_dict)
+					return ActionModelClass(**{action_type: validated_params})
+				except Exception as e:
+					logger.warning(f"Could not create {action_type} param_model: {e}, params_dict: {params_dict}")
+					return None
+			else:
+				logger.warning(f"Action {action_type} not found in registry")
+				return None
 
 		else:
 			logger.warning(f"Unknown action type: {action_type}")

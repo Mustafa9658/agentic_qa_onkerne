@@ -397,7 +397,27 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
                         if long_term_memory:
                             action_results_text += f'{long_term_memory}\n'
                         elif extracted_content and not include_only_once:
-                            action_results_text += f'{extracted_content}\n'
+                            # Detect if extracted_content contains error-like messages
+                            # Some actions return error messages via extracted_content (e.g., "Element index X not available")
+                            error_indicators = [
+                                "not available",
+                                "not found",
+                                "failed",
+                                "error",
+                                "cannot",
+                                "unable",
+                                "invalid",
+                                "does not exist",
+                                "not available - page may have changed"
+                            ]
+                            is_error_message = any(indicator.lower() in extracted_content.lower() for indicator in error_indicators)
+                            
+                            if is_error_message:
+                                # Format as error so LLM recognizes it as a failure
+                                error_text = extracted_content[:200] + '......' + extracted_content[-100:] if len(extracted_content) > 200 else extracted_content
+                                action_results_text += f'Error: {error_text}\n'
+                            else:
+                                action_results_text += f'{extracted_content}\n'
                         
                         if error:
                             error_text = error[:200] + '......' + error[-100:] if len(error) > 200 else error
@@ -784,9 +804,30 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         # LangChain uses with_structured_output() method, NOT output_format parameter
         # Use function_calling method for OpenAI compatibility with complex nested schemas
         structured_llm = llm.with_structured_output(dynamic_agent_output, method="function_calling")
-        parsed: AgentOutput = await structured_llm.ainvoke(langchain_messages)
+        raw_response = await structured_llm.ainvoke(langchain_messages)
+        
+        # Browser-use pattern: Manually validate the response to match schema (chat_browser_use.py:178)
+        # LangChain's with_structured_output() may return dict or Pydantic model
+        # Convert to dict if needed, then validate against AgentOutput schema
+        try:
+            if isinstance(raw_response, dict):
+                # Already a dict - validate directly
+                completion_data = raw_response
+            else:
+                # Pydantic model or other object - convert to dict
+                completion_data = raw_response.model_dump() if hasattr(raw_response, 'model_dump') else dict(raw_response)
+            
+            # Validate against schema (browser-use pattern)
+            parsed: AgentOutput = dynamic_agent_output.model_validate(completion_data)
+        except Exception as e:
+            logger.error(f"Failed to validate LLM response against AgentOutput schema: {e}")
+            logger.error(f"Raw response type: {type(raw_response)}")
+            logger.error(f"Raw response value: {raw_response}")
+            # Re-raise as ValidationError to match browser-use pattern
+            from pydantic import ValidationError
+            raise ValidationError(f"LLM response validation failed: {e}") from e
 
-        logger.info(f"LLM response received: {parsed}")
+        logger.info(f"LLM response received and validated: {parsed}")
 
         # Save LLM response
         log_data["llm_response"] = {

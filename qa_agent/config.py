@@ -3,7 +3,7 @@ Configuration settings for QA Agent
 """
 import os
 from pathlib import Path
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 
@@ -33,8 +33,12 @@ class Settings(BaseSettings):
     # Anthropic Settings
     anthropic_api_key: Optional[str] = None
 
+    # Google/Gemini Settings
+    gemini_api_key: Optional[str] = None
+    gemini_model: Optional[str] = None
+
     # Browser Settings (CDP & browser-use)
-    headless: bool = True
+    headless: bool = False  # Set to False for headful browser (kernel-docker container)
     browser_timeout: int = 30000  # milliseconds
     navigation_timeout: int = 30000  # milliseconds
     action_timeout: int = 5000  # milliseconds
@@ -44,7 +48,7 @@ class Settings(BaseSettings):
     kernel_cdp_host: str = "localhost"
     kernel_cdp_port: int = 9222
 
-    # Retry Strategy
+    # Retry Strategy                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
     retry_delay: float = 1.0  # seconds between retries
     retry_backoff: float = 2.0  # exponential backoff multiplier
 
@@ -63,10 +67,12 @@ class Settings(BaseSettings):
     # Windows: C:/Windows/Fonts, Linux: /usr/share/fonts, macOS: /Library/Fonts
     # The GIF module will auto-detect the correct path based on platform
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore"  # Ignore extra fields from env vars that aren't defined
+    )
 
 
 settings = Settings()
