@@ -28,11 +28,21 @@ def should_continue(state: QAAgentState) -> Literal["continue", "retry", "done"]
         if state.get("completed"):
             logger.info("Workflow completed")
             return "done"
-        
+
         if state.get("error"):
             logger.error(f"Workflow error: {state.get('error')}")
             return "done"
-        
+
+        # Check max consecutive failures (browser pattern: service.py:1755-1761)
+        # If final_response_after_failure is True, allow one final attempt after max_failures
+        consecutive_failures = state.get("consecutive_failures", 0)
+        max_failures = state.get("max_failures", 3)
+        final_response_after_failure = state.get("final_response_after_failure", True)
+
+        if consecutive_failures >= max_failures + int(final_response_after_failure):
+            logger.error(f"❌ Stopping due to {max_failures} consecutive failures")
+            return "done"
+
         # Check max steps (infinite loop prevention)
         step_count = state.get("step_count", 0)
         max_steps = state.get("max_steps", settings.max_steps)
@@ -93,6 +103,15 @@ def should_continue_after_think(state: QAAgentState) -> Literal["continue", "don
             return "done"
 
         if state.get("error"):
+            return "done"
+
+        # Check max consecutive failures (browser pattern)
+        consecutive_failures = state.get("consecutive_failures", 0)
+        max_failures = state.get("max_failures", 3)
+        final_response_after_failure = state.get("final_response_after_failure", True)
+
+        if consecutive_failures >= max_failures + int(final_response_after_failure):
+            logger.error(f"❌ Stopping in think router due to {max_failures} consecutive failures")
             return "done"
 
         # Infinite loop prevention

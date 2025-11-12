@@ -35,6 +35,7 @@ from qa_agent.observability import observe_debug
 from qa_agent.tools.registry.service import Registry
 from qa_agent.tools.utils import get_click_description
 from qa_agent.tools.views import (
+	CheckboxAction,
 	ClickElementAction,
 	CloseTabAction,
 	DoneAction,
@@ -346,6 +347,43 @@ class Tools(Generic[Context]):
 					log_msg = f"Typed '{params.text}'"
 
 				logger.debug(log_msg)
+
+				# CRITICAL: Include actual field state in extracted_content for LLM
+				# This ensures LLM sees what ACTUALLY happened, not just what we tried
+				if input_metadata and isinstance(input_metadata, dict):
+					actual_value = input_metadata.get('actual_field_value')
+					validation_errors = input_metadata.get('field_validation_errors')
+					verification_passed = input_metadata.get('field_verification_passed', True)
+					
+					# CRITICAL: Surface console errors to LLM for full visibility
+					console_errors = input_metadata.get('console_errors')
+					console_validation_errors = input_metadata.get('console_validation_errors')
+					
+					# Enhance message with actual results
+					# MAKE FAILURES EXPLICIT with warning prefix so LLM recognizes them immediately
+					if actual_value is not None and not has_sensitive_data:
+						if verification_passed:
+							msg += f" → Field now contains: '{actual_value}'"
+						else:
+							# EXPLICIT FAILURE MARKER - LLM must see this clearly
+							if actual_value:
+								msg = f"⚠️ INPUT FAILED: {msg} → Field contains: '{actual_value}' (expected: '{params.text}')"
+							else:
+								msg = f"⚠️ INPUT FAILED: {msg} → Field is empty (expected: '{params.text}')"
+						
+						if validation_errors:
+							msg += f" → Validation error: {validation_errors}"
+					
+					# Add console errors to message for LLM visibility
+					if console_validation_errors:
+						# Format validation errors clearly
+						validation_msgs = '; '.join(console_validation_errors[:2])  # Max 2 for token efficiency
+						msg += f" → Console validation errors: {validation_msgs}"
+					
+					if console_errors:
+						# Format JavaScript errors clearly
+						error_msgs = '; '.join(console_errors[:2])  # Max 2 for token efficiency
+						msg += f" → Console errors: {error_msgs}"
 
 				# Include input coordinates in metadata if available
 				return ActionResult(
@@ -910,7 +948,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 		# Dropdown Actions
 
 		@self.registry.action(
-			'Get all available options from a dropdown/select element or ARIA combobox. Use this FIRST before selecting to see what options are available. Returns list of options with their text/values.',
+			'Get all available options from a dropdown/select element or ARIA combobox. Use this FIRST before selecting to see what options are available. Returns list of options with their text/values. IMPORTANT: Use the container element index (role=combobox, role=listbox, role=menu, or <select> tag), NOT option element indices. The action searches for options within the container.',
 			param_model=GetDropdownOptionsAction,
 		)
 		async def dropdown_options(params: GetDropdownOptionsAction, browser_session: BrowserSession):
@@ -938,7 +976,274 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			)
 
 		@self.registry.action(
-			'Select an option from a dropdown/select element or ARIA combobox by the exact text of the option. Use after dropdown_options to see available choices. Works for native <select> and custom dropdowns.',
+			'Check or uncheck a checkbox/radio button. Use checked=True to ensure checked, checked=False to ensure unchecked, checked=None to toggle.',
+			param_model=CheckboxAction,
+		)
+		async def checkbox(params: CheckboxAction, browser_session: BrowserSession):
+			"""Handle checkbox/radio button with state management."""
+			node = await browser_session.get_element_by_index(params.index)
+			
+			# Helper function to find available checkboxes
+			async def find_available_checkboxes() -> list[dict]:
+				"""
+				Find all checkbox/radio elements in the current browser state.
+				
+				Based on research: Uses CDP DOM queries to find:
+				- Native <input type="checkbox"> and <input type="radio">
+				- ARIA checkboxes/radios (role="checkbox" or role="radio")
+				- Handles hidden/overlapped checkboxes
+				
+				Uses cached=False to ensure we get FRESH data after action failures,
+				as the DOM may have changed (form submitted, page updated, etc.)
+				"""
+				try:
+					# Use cached=False to get fresh DOM state - important after action failures
+					# The DOM might have changed, so we need current state, not stale cache
+					browser_state = await browser_session.get_browser_state_summary(
+						include_screenshot=False,
+						cached=False  # Get fresh data - DOM may have changed after action failure
+					)
+					
+					if not browser_state or not browser_state.dom_state or not browser_state.dom_state.selector_map:
+						return []
+					
+					checkboxes = []
+					selector_map = browser_state.dom_state.selector_map
+					
+					for idx, element_node in selector_map.items():
+						is_checkbox = False
+						checkbox_type = None
+						
+						# Check if it's an input with type checkbox or radio
+						if element_node.tag_name.lower() == 'input':
+							input_type = element_node.attributes.get('type', '').lower()
+							if input_type in ['checkbox', 'radio']:
+								is_checkbox = True
+								checkbox_type = input_type
+						# Also check for ARIA checkboxes/radios (role="checkbox" or role="radio")
+						# Research shows ARIA roles are important for accessibility and custom checkboxes
+						elif element_node.attributes.get('role', '').lower() in ['checkbox', 'radio']:
+							is_checkbox = True
+							checkbox_type = element_node.attributes.get('role', '').lower()
+						
+						if is_checkbox:
+							# Get element description (improved based on research)
+							# Use get_meaningful_text_for_llm() instead of non-existent text_content attribute
+							text = element_node.get_meaningful_text_for_llm() if hasattr(element_node, 'get_meaningful_text_for_llm') else ''
+							aria_label = element_node.attributes.get('aria-label', '')
+							name = element_node.attributes.get('name', '')
+							id_attr = element_node.attributes.get('id', '')
+							aria_labelledby = element_node.attributes.get('aria-labelledby', '')
+
+							# Build description with more context
+							desc_parts = []
+							if aria_label:
+								desc_parts.append(f'aria-label="{aria_label}"')
+							if name:
+								desc_parts.append(f'name="{name}"')
+							if id_attr:
+								desc_parts.append(f'id="{id_attr}"')
+							if aria_labelledby:
+								desc_parts.append(f'aria-labelledby="{aria_labelledby}"')
+							if text.strip():
+								desc_parts.append(f'text="{text.strip()[:50]}"')
+
+							description = ' | '.join(desc_parts) if desc_parts else 'no description'
+
+							# Check if checked (for input) or aria-checked (for ARIA)
+							checked = False
+							if element_node.tag_name.lower() == 'input':
+								# HTML boolean attribute spec: https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#boolean-attributes
+								# Presence = True, Absence = False, except explicit 'false' = False
+								checked_attr = element_node.attributes.get('checked')
+								if checked_attr is None:
+									# Attribute not present
+									checked = False
+								else:
+									# Attribute present - only 'false' (case-insensitive) means unchecked
+									# Valid forms: checked, checked="", checked="checked", checked="true" all mean checked=True
+									checked = checked_attr.lower() != 'false'
+							else:
+								# ARIA checkboxes use aria-checked="true" or aria-checked="false"
+								aria_checked = element_node.attributes.get('aria-checked', '').lower()
+								checked = aria_checked == 'true'
+							
+							checked_str = 'checked' if checked else 'unchecked'
+							
+							# Add tag info for ARIA checkboxes
+							tag_info = f'<{element_node.tag_name}>'
+							if checkbox_type == 'checkbox' and element_node.tag_name.lower() != 'input':
+								tag_info += ' role="checkbox"'
+							elif checkbox_type == 'radio' and element_node.tag_name.lower() != 'input':
+								tag_info += ' role="radio"'
+							
+							checkboxes.append({
+								'index': idx,
+								'type': checkbox_type,
+								'tag': tag_info,
+								'description': description,
+								'checked': checked_str
+							})
+					
+					return checkboxes
+				except Exception as e:
+					logger.debug(f"Error finding checkboxes: {e}")
+					return []
+			
+			# Case 1: Element not found - Use extracted_content (like click/input/dropdown actions)
+			if node is None:
+				available_checkboxes = await find_available_checkboxes()
+				
+				msg = f'❌ ERROR: Element index {params.index} not available - page may have changed.'
+				
+				if available_checkboxes:
+					msg += f'\n\n✅ Available checkbox/radio elements on this page ({len(available_checkboxes)} found):\n'
+					# Show up to 5 checkboxes
+					for cb in available_checkboxes[:5]:
+						tag_info = cb.get('tag', '')
+						if tag_info:
+							msg += f'  - Index {cb["index"]}: {tag_info} {cb["type"]} ({cb["checked"]}) - {cb["description"]}\n'
+						else:
+							msg += f'  - Index {cb["index"]}: {cb["type"]} ({cb["checked"]}) - {cb["description"]}\n'
+					if len(available_checkboxes) > 5:
+						msg += f'  ... and {len(available_checkboxes) - 5} more (check CURRENT <browser_state> for all elements)\n'
+					msg += f'\n⚠️ ACTION REQUIRED: Use one of the checkbox indices listed above (e.g., {available_checkboxes[0]["index"]}) instead of index {params.index}.'
+					msg += '\n⚠️ Review the CURRENT <browser_state> above to see all available elements with their correct indices.'
+				else:
+					msg += '\n\n❌ No checkbox/radio elements found on this page.'
+					msg += '\n⚠️ The page may not have loaded completely, or checkboxes may be dynamically generated. Try waiting or refreshing the browser state.'
+				
+				logger.warning(f'⚠️ {msg}')
+				return ActionResult(extracted_content=msg)
+			
+			# Case 2: Element exists but is not an input tag
+			if node.tag_name.lower() != 'input':
+				element_info = f'Element index {params.index} is a <{node.tag_name}> tag'
+
+				# Get element description
+				# Use get_meaningful_text_for_llm() instead of non-existent text_content attribute
+				text = node.get_meaningful_text_for_llm() if hasattr(node, 'get_meaningful_text_for_llm') else ''
+				aria_label = node.attributes.get('aria-label', '')
+				if text.strip():
+					element_info += f' with text: "{text.strip()[:100]}"'
+				elif aria_label:
+					element_info += f' with aria-label: "{aria_label}"'
+				
+				available_checkboxes = await find_available_checkboxes()
+				
+				error_msg = f'{element_info}, not an <input> tag.\n\n'
+				error_msg += 'The checkbox might be:\n'
+				error_msg += '  - A child element of this element (check children in browser_state)\n'
+				error_msg += '  - A nearby element (check surrounding elements in browser_state)\n'
+				error_msg += '  - Wrapped by this element (the actual checkbox is inside)\n\n'
+				
+				if available_checkboxes:
+					error_msg += f'Available checkbox/radio elements on this page ({len(available_checkboxes)} found):\n'
+					for cb in available_checkboxes[:5]:
+						tag_info = cb.get('tag', '')
+						if tag_info:
+							error_msg += f'  - Index {cb["index"]}: {tag_info} {cb["type"]} ({cb["checked"]}) - {cb["description"]}\n'
+						else:
+							error_msg += f'  - Index {cb["index"]}: {cb["type"]} ({cb["checked"]}) - {cb["description"]}\n'
+					if len(available_checkboxes) > 5:
+						error_msg += f'  ... and {len(available_checkboxes) - 5} more\n'
+					error_msg += '\n'
+				
+				error_msg += '⚠️ SUGGESTION: Review the CURRENT <browser_state> above to find the correct checkbox element. Look for elements with type="checkbox" or role="checkbox".'
+				
+				return ActionResult(error=error_msg)
+			
+			# Case 3: Element is input but not checkbox/radio
+			input_type = node.attributes.get('type', '').lower()
+			if input_type not in ['checkbox', 'radio']:
+				element_info = f'Element index {params.index} is an <input> tag with type="{input_type}"'
+				
+				# Get element description
+				name = node.attributes.get('name', '')
+				id_attr = node.attributes.get('id', '')
+				if name:
+					element_info += f', name="{name}"'
+				if id_attr:
+					element_info += f', id="{id_attr}"'
+				
+				available_checkboxes = await find_available_checkboxes()
+				
+				error_msg = f'{element_info}, not a checkbox/radio.\n\n'
+				
+				if available_checkboxes:
+					error_msg += f'Available checkbox/radio elements on this page ({len(available_checkboxes)} found):\n'
+					for cb in available_checkboxes[:5]:
+						tag_info = cb.get('tag', '')
+						if tag_info:
+							error_msg += f'  - Index {cb["index"]}: {tag_info} {cb["type"]} ({cb["checked"]}) - {cb["description"]}\n'
+						else:
+							error_msg += f'  - Index {cb["index"]}: {cb["type"]} ({cb["checked"]}) - {cb["description"]}\n'
+					if len(available_checkboxes) > 5:
+						error_msg += f'  ... and {len(available_checkboxes) - 5} more\n'
+					error_msg += '\n'
+				else:
+					error_msg += 'No checkbox/radio elements found on this page.\n\n'
+				
+				error_msg += '⚠️ SUGGESTION: Review the CURRENT <browser_state> above to find elements with type="checkbox" or type="radio". Use the indices shown in the current browser_state.'
+				
+				return ActionResult(error=error_msg)
+			
+			# Success case: Element is a valid checkbox/radio
+			# Create element and check/uncheck using improved multi-strategy approach
+			from qa_agent.actor.element import Element
+			element = Element(
+				browser_session,
+				node.backend_node_id,
+				browser_session.agent_focus.session_id if browser_session.agent_focus else None
+			)
+			
+			try:
+				# Use improved check() method with multiple strategies (click + direct property setting)
+				await element.check(force_state=params.checked)
+				
+				# Verify final state (critical for state-controlled checkboxes)
+				await asyncio.sleep(0.1)  # Small delay for state updates
+				final_state = await element.get_checkbox_state()
+				state_str = 'checked' if final_state['checked'] else 'unchecked'
+				
+				return ActionResult(
+					extracted_content=f'✅ Checkbox is now {state_str}',
+					long_term_memory=f'Set checkbox {params.index} to {state_str}'
+				)
+			except RuntimeError as e:
+				# Checkbox interaction failed - provide helpful error with available alternatives
+				error_msg = str(e)
+				available_checkboxes = await find_available_checkboxes()
+				
+				# Build comprehensive error message
+				msg = f'❌ Failed to interact with checkbox at index {params.index}: {error_msg}\n\n'
+				
+				if available_checkboxes:
+					msg += f'✅ Available checkbox/radio elements on this page ({len(available_checkboxes)} found):\n'
+					for cb in available_checkboxes[:5]:
+						tag_info = cb.get('tag', '')
+						if tag_info:
+							msg += f'  - Index {cb["index"]}: {tag_info} {cb["type"]} ({cb["checked"]}) - {cb["description"]}\n'
+						else:
+							msg += f'  - Index {cb["index"]}: {cb["type"]} ({cb["checked"]}) - {cb["description"]}\n'
+					if len(available_checkboxes) > 5:
+						msg += f'  ... and {len(available_checkboxes) - 5} more\n'
+					msg += f'\n⚠️ SUGGESTION: Try using one of the checkbox indices listed above instead of index {params.index}.'
+					msg += '\n⚠️ The checkbox might be hidden, overlapped, or state-controlled. Review the CURRENT <browser_state> for all available elements.'
+				else:
+					msg += '❌ No checkbox/radio elements found on this page.'
+					msg += '\n⚠️ The page may not have loaded completely, or checkboxes may be dynamically generated. Try waiting or refreshing the browser state.'
+				
+				logger.warning(f'⚠️ {msg}')
+				return ActionResult(extracted_content=msg)
+			except Exception as e:
+				# Unexpected error
+				error_msg = f'Unexpected error interacting with checkbox at index {params.index}: {str(e)}'
+				logger.error(f'❌ {error_msg}', exc_info=True)
+				return ActionResult(error=error_msg)
+
+		@self.registry.action(
+			'Select an option from a dropdown/select element or ARIA combobox by the exact text of the option. Use after dropdown_options to see available choices. Works for native <select> and custom dropdowns. IMPORTANT: Use the container element index (role=combobox, role=listbox, role=menu, or <select> tag), NOT option element indices. The action searches for options within the container and clicks the matching option. Alternative: When dropdown is already open and option elements (role=option) are visible in browser_state, you can click them directly using the click action.',
 			param_model=SelectDropdownOptionAction,
 		)
 		async def select_dropdown(params: SelectDropdownOptionAction, browser_session: BrowserSession):

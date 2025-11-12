@@ -2,7 +2,8 @@ import asyncio
 
 from pydantic import BaseModel
 
-from browser_use import Browser, ChatOpenAI
+from qa_agent.browser import BrowserSession as Browser
+from qa_agent.llm import get_llm
 
 TASK = """
 On the current wikipedia page, find the latest huge edit and tell me what is was about.
@@ -19,14 +20,14 @@ class LatestEditFinder(BaseModel):
 	edit_url: str
 
 
-llm = ChatOpenAI('gpt-4.1-mini')
+llm = get_llm(model='gpt-4o-mini')
 
 
 async def main():
 	"""
-	Main function demonstrating mixed automation with Browser-Use and Playwright.
+	Main function demonstrating mixed automation with browser and Playwright.
 	"""
-	print('🚀 Mixed Automation with Browser-Use and Actor API')
+	print('🚀 Mixed Automation with browser and Actor API')
 
 	browser = Browser(keep_alive=True)
 	await browser.start()
@@ -34,7 +35,7 @@ async def main():
 	page = await browser.get_current_page() or await browser.new_page()
 
 	# Go to apple wikipedia page
-	await page.goto('https://browser-use.github.io/stress-tests/challenges/angularjs-form.html')
+	await page.goto('https://browser.github.io/stress-tests/challenges/angularjs-form.html')
 
 	await asyncio.sleep(1)
 

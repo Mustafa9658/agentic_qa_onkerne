@@ -276,7 +276,7 @@ class BrowserChannel(str, Enum):
 	MSEDGE_CANARY = 'msedge-canary'
 
 
-# Using constants from central location in browser_use.config
+# Using constants from central location in qa_agent.config
 BROWSERUSE_DEFAULT_CHANNEL = BrowserChannel.CHROMIUM
 
 
@@ -421,12 +421,12 @@ class BrowserLaunchArgs(BaseModel):
 
 			# Create unique directory in /tmp for downloads
 			unique_id = str(uuid.uuid4())[:8]  # 8 characters
-			downloads_path = Path(f'/tmp/browser-use-downloads-{unique_id}')
+			downloads_path = Path(f'/tmp/browser-downloads-{unique_id}')
 
 			# Ensure path doesn't already exist (extremely unlikely but possible)
 			while downloads_path.exists():
 				unique_id = str(uuid.uuid4())[:8]
-				downloads_path = Path(f'/tmp/browser-use-downloads-{unique_id}')
+				downloads_path = Path(f'/tmp/browser-downloads-{unique_id}')
 
 			self.downloads_path = downloads_path
 			self.downloads_path.mkdir(parents=True, exist_ok=True)
@@ -503,7 +503,7 @@ class BrowserLaunchPersistentContextArgs(BrowserLaunchArgs, BrowserContextArgs):
 	def validate_user_data_dir(cls, v: str | Path | None) -> str | Path:
 		"""Validate user data dir is set to a non-default path."""
 		if v is None:
-			return tempfile.mkdtemp(prefix='browser-use-user-data-dir-')
+			return tempfile.mkdtemp(prefix='browser-user-data-dir-')
 		return Path(v).expanduser().resolve()
 
 
@@ -552,7 +552,7 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 	is_local: bool = Field(default=False, description='Whether this is a local browser instance')
 	use_cloud: bool = Field(
 		default=False,
-		description='Use browser-use cloud browser service instead of local browser',
+		description='Use browser cloud browser service instead of local browser',
 	)
 
 	@property
@@ -585,7 +585,7 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 	# New consolidated proxy config (typed)
 	proxy: ProxySettings | None = Field(
 		default=None,
-		description='Proxy settings. Use browser_use.browser.profile.ProxySettings(server, bypass, username, password)',
+		description='Proxy settings. Use qa_agent.browser.profile.ProxySettings(server, bypass, username, password)',
 	)
 	enable_default_extensions: bool = Field(
 		default=True,

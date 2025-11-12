@@ -16,9 +16,7 @@ from typing import Dict, Any
 from qa_agent.state import QAAgentState
 from qa_agent.config import settings
 from qa_agent.llm import get_llm
-from qa_agent.prompts import build_think_prompt
 from qa_agent.prompts.browser_use_prompts import SystemPrompt, AgentMessagePrompt
-from qa_agent.utils import parse_llm_action_plan, validate_action
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +41,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         # Increment step count
         step_count = state.get("step_count", 0) + 1
         
-        # Get browser state from browser-use BrowserSession
+        # Get browser state from browser BrowserSession
         from qa_agent.utils.session_registry import get_session
 
         browser_session_id = state.get("browser_session_id")
@@ -54,8 +52,8 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         if not browser_session:
             raise ValueError(f"Browser session {browser_session_id} not found in registry")
 
-        # Get browser state summary with DOM extraction (browser-use native call)
-        # Browser-use pattern: ALWAYS get fresh state at start of each step (see agent/service.py _prepare_context)
+        # Get browser state summary with DOM extraction (browser native call)
+        # browser pattern: ALWAYS get fresh state at start of each step (see agent/service.py _prepare_context)
         # CRITICAL: On retry or after tab switch, this ensures we see the ACTUAL current page state, not stale state
         
         # OPTIMIZATION: Check if act node already provided fresh state after actions
@@ -72,19 +70,27 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
             # This ensures we see dropdowns, modals, and dynamic content that appeared after actions
             logger.info("✅ Using pre-fetched fresh state from act node (after DOM stability wait)")
             logger.info("   This ensures LLM sees CURRENT page structure (dropdowns, modals, new content)")
-            
-            # Still need to get full BrowserStateSummary object for LLM (not just summary dict)
-            # But we can use cached=False to ensure consistency
-            browser_state = await browser_session.get_browser_state_summary(
-                include_screenshot=False,
-                include_recent_events=False,
-                cached=False  # Force fresh to ensure consistency with Act node's state
-            )
-            
-            # Verify we got the same URL as Act node reported (sanity check)
-            act_node_url = state.get("current_url")
-            if act_node_url and browser_state.url != act_node_url:
-                logger.warning(f"⚠️ URL mismatch: Act node reported {act_node_url}, Think node got {browser_state.url}")
+
+            # FIX: Use the ACTUAL BrowserStateSummary object ACT already fetched
+            # This eliminates the "1 step ahead" race condition
+            browser_state = state.get("fresh_browser_state_object")
+
+            if browser_state:
+                logger.info("✅ Using ACTUAL fresh_browser_state_object from ACT (no re-fetch, perfect sync)")
+                act_node_url = state.get("current_url")
+                if act_node_url and browser_state.url == act_node_url:
+                    logger.info(f"✅ URL verified: {act_node_url[:60]}")
+            else:
+                # Fallback: ACT didn't pass the object (older code), fetch it
+                logger.warning("⚠️ fresh_browser_state_object not found, falling back to re-fetch")
+                browser_state = await browser_session.get_browser_state_summary(
+                    include_screenshot=False,
+                    include_recent_events=False,
+                    cached=False
+                )
+                act_node_url = state.get("current_url")
+                if act_node_url and browser_state.url != act_node_url:
+                    logger.warning(f"⚠️ URL mismatch: Act node reported {act_node_url}, Think node got {browser_state.url}")
         else:
             # Normal flow: fetch fresh state (first step, or if Act node didn't provide state)
             # CRITICAL: Check if verify node just switched tabs - log current tab before getting state
@@ -104,10 +110,10 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         if current_tab_before_state and current_tab_after_state and current_tab_before_state != current_tab_after_state:
             logger.warning(f"⚠️ Tab changed during state retrieval: {current_tab_before_state[-4:]} → {current_tab_after_state[-4:]}")
 
-        # Extract DOM data for logging/history (browser-use handles DOM internally in AgentMessagePrompt)
+        # Extract DOM data for logging/history (browser handles DOM internally in AgentMessagePrompt)
         current_url = browser_state.url
         current_title = browser_state.title
-        # Defensive check: ensure selector_map is always a dict (browser-use should return dict)
+        # Defensive check: ensure selector_map is always a dict (browser should return dict)
         selector_map = {}
         if browser_state.dom_state and hasattr(browser_state.dom_state, 'selector_map'):
             selector_map_raw = browser_state.dom_state.selector_map
@@ -116,7 +122,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
             else:
                 logger.warning(f"selector_map is not a dict (type: {type(selector_map_raw)}), using empty dict")
         
-        # Check for new tabs opened by previous actions (browser-use pattern: check tabs from state)
+        # Check for new tabs opened by previous actions (browser pattern: check tabs from state)
         # This ensures we're aware of tabs opened by actions, even if we haven't switched yet
         # Defensive check: ensure current_tabs is always a list
         current_tabs = []
@@ -127,7 +133,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
                 logger.warning(f"browser_state.tabs is not a list (type: {type(browser_state.tabs)}), using empty list")
         tab_info = [{"id": t.target_id[-4:], "title": t.title, "url": t.url} for t in current_tabs]
         
-        # Detect if this is a retry after failure OR if we just switched tabs (browser-use pattern: always verify current state)
+        # Detect if this is a retry after failure OR if we just switched tabs (browser pattern: always verify current state)
         history = state.get("history", [])
         is_retry = False
         just_switched_tab = state.get("just_switched_tab", False)
@@ -136,7 +142,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         previous_url = None
         previous_tab_id = None
         
-        # Check if verify node just switched tabs (browser-use pattern: fresh state is automatically sent)
+        # Check if verify node just switched tabs (browser pattern: fresh state is automatically sent)
         # The browser_state already contains all elements from the new page - LLM will analyze dynamically
         tab_switch_system_message = None
         if just_switched_tab:
@@ -163,7 +169,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
                 if last_entry.get("verification_status") == "fail":
                     is_retry = True
                     # Get previous URL/tab from history for comparison
-                    # Browser-use pattern: compare current state with previous state to detect changes
+                    # browser pattern: compare current state with previous state to detect changes
                     for entry in reversed(history):
                         if isinstance(entry, dict) and entry.get("node") == "think":
                             browser_state_prev = entry.get("browser_state") or entry.get("browser_state_summary", {})
@@ -214,12 +220,12 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
             logger.info(f"   Current tab: {current_tab_id[-4:] if current_tab_id else 'unknown'}")
             logger.info(f"   This will be handled by verify node - LLM should see tab info in browser_state")
         
-        # Browser-use pattern: get_browser_state_summary() already handles:
+        # browser pattern: get_browser_state_summary() already handles:
         # - URL detection via get_current_page_url() (CDP-based, reliable)
         # - Network idle detection via DOMWatchdog._get_pending_network_requests()
         # - Page stability waiting (1s if pending requests exist)
         # - DOM building and element extraction
-        # We trust browser-use's built-in mechanisms - no need to re-implement URL/page loading detection
+        # We trust browser's built-in mechanisms - no need to re-implement URL/page loading detection
         # DOMWatchdog.on_BrowserStateRequestEvent() handles all of this automatically
         
         # CRITICAL: Log current tab state prominently so we can verify LLM gets correct tab's DOM
@@ -239,26 +245,32 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         current_goal = state.get("current_goal")
         max_steps = state.get("max_steps", 50)
 
-        # GOAL TRACKING: Check if current goal is complete and update task context
-        # This prevents the agent from repeating completed steps (e.g., signup after successful login)
+        # GOAL TRACKING: Page state detection + informational context (Phase 4: browser pattern)
+        # Goals track major phase transitions (e.g., "we're on dashboard, signup done")
+        # LLM sees goals in history/context but decides next steps via todo.md and next_goal field
+        # This matches browser pattern: goals inform LLM, but LLM generates next_goal itself
         goals = state.get("goals", [])
         completed_goals = state.get("completed_goals", [])
         current_goal_index = state.get("current_goal_index", 0)
+        new_completed_goal_id = None  # Track if we completed a goal this step
 
-        logger.info(f"📊 GOAL TRACKING: {len(completed_goals)}/{len(goals)} goals completed, current index: {current_goal_index}")
-
+        # Track goals for informational context - LLM can see them in history
+        # But don't modify task context - LLM manages progression via todo.md
         if goals and current_goal_index < len(goals):
             current_goal_obj = goals[current_goal_index]
             goal_id = current_goal_obj.get("id", "")
             goal_desc = current_goal_obj.get("description", "")
             completion_signals = current_goal_obj.get("completion_signals", [])
 
+            logger.info(f"📊 GOAL TRACKING: {len(completed_goals)}/{len(goals)} goals completed, current index: {current_goal_index}")
             logger.info(f"   Current goal: [{goal_id}] {goal_desc}")
-            logger.info(f"   Completion signals: {completion_signals}")
 
             # Check if current goal appears complete based on page state (URL/title)
+            # This detects major phase transitions (e.g., "now on dashboard")
+            current_url_str = current_url or ""
+            current_title_str = current_title or ""
             is_goal_complete = any(
-                signal.lower() in current_url.lower() or signal.lower() in current_title.lower()
+                signal.lower() in current_url_str.lower() or signal.lower() in current_title_str.lower()
                 for signal in completion_signals
             )
 
@@ -267,34 +279,33 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
             logger.info(f"   Goal complete? {is_goal_complete}")
 
             if is_goal_complete and goal_id not in completed_goals:
-                # Goal just completed! Mark it and move to next goal
+                # Goal phase detected - track it for informational context
                 logger.info(f"🎯 Goal '{goal_id}' COMPLETED! (detected by URL/title signals)")
-                logger.info(f"   Marking goal as complete and advancing to next goal")
-
-                # Update state to mark goal complete and advance
-                completed_goals = completed_goals + [goal_id]
+                logger.info(f"   Progress: {len(completed_goals) + 1}/{len(goals)} goals completed")
+                
+                # Track completion for state consistency (reducer will append)
+                new_completed_goal_id = goal_id
                 current_goal_index = current_goal_index + 1
+                completed_goals = completed_goals + [goal_id]  # For local use, reducer handles accumulation
 
-                logger.info(f"   Progress: {len(completed_goals)}/{len(goals)} goals completed")
-
-                # Update task context for next goal
+                # Informational context: Show what's been completed and what's next
+                # This helps LLM understand phase transitions, but LLM still decides actions via todo.md
                 if current_goal_index < len(goals):
                     next_goal_obj = goals[current_goal_index]
                     next_goal_desc = next_goal_obj.get("description", "")
-                    logger.info(f"   Next goal: {next_goal_desc}")
-                    task = f"CURRENT GOAL: {next_goal_desc}\n\nCompleted goals: {', '.join(completed_goals)}\n\nFull task for context:\n{task}"
+                    logger.info(f"   Next goal phase: {next_goal_desc}")
+                    # Note: We log this but don't modify task - LLM sees goals in history
                 else:
-                    logger.info(f"   ✅ ALL GOALS COMPLETED!")
-                    task = f"All major goals completed. Complete any remaining cleanup.\n\nOriginal task: {task}"
+                    logger.info(f"   ✅ ALL GOAL PHASES COMPLETED!")
+                    # Note: LLM still manages final steps via todo.md
             else:
-                # Goal still in progress - update task to focus LLM on current goal
+                # Goal still in progress - log for context
                 if completed_goals:
-                    logger.info(f"💡 Focusing LLM on current goal (already completed {len(completed_goals)} goals)")
-                    task = f"CURRENT GOAL: {goal_desc}\n\nCompleted goals: {', '.join(completed_goals)}\n\nFull task for context:\n{task}"
+                    logger.info(f"💡 Current phase: {goal_desc} (already completed {len(completed_goals)} phases)")
                 else:
-                    logger.info(f"💡 Working on first goal (no goals completed yet)")
+                    logger.info(f"💡 Starting first phase: {goal_desc}")
 
-        # Browser-use pattern: On retry, emphasize that LLM should use CURRENT browser_state
+        # browser pattern: On retry, emphasize that LLM should use CURRENT browser_state
         # The browser_state sent in this step contains FRESH element indices from the current page
         # Human QA approach: Look at the page, see what's there, then interact with the right elements
         if is_retry:
@@ -302,8 +313,8 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
             logger.info(f"   LLM will see CURRENT page state and can adapt actions based on what's actually available")
             logger.info(f"   Previous failure context is included in agent_history above")
 
-        # Build prompt using browser-use SystemPrompt and AgentMessagePrompt
-        logger.info(f"Building prompt for task using browser-use prompts: {task[:100]}...")
+        # Build prompt using browser SystemPrompt and AgentMessagePrompt
+        logger.info(f"Building prompt for task using browser prompts: {task[:100]}...")
 
         # Create SystemPrompt (loads from system_prompt.md)
         system_prompt = SystemPrompt(
@@ -321,20 +332,20 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
 
         step_info = AgentStepInfo(step_number=step_count, max_steps=max_steps)
 
-        # Format history for agent_history_description (browser-use HistoryItem format)
-        # Browser-use format: <step_N>\nevaluation\nmemory\nnext_goal\nResult\naction_results\n</step_N>
+        # Format history for agent_history_description (browser HistoryItem format)
+        # browser format: <step_N>\nevaluation\nmemory\nnext_goal\nResult\naction_results\n</step_N>
         agent_history_description = ""
-        read_state_description = ""  # Track extract() results separately (browser-use pattern)
+        read_state_description = ""  # Track extract() results separately (browser pattern)
         read_state_idx = 0
         
         if history:
-            # Get last 5 steps (browser-use uses max_history_items)
+            # Get last 5 steps (browser uses max_history_items)
             recent_steps = history[-5:]
             for step_entry in recent_steps:
                 step_num = step_entry.get("step", 0)
                 node = step_entry.get("node", "unknown")
                 
-                # Build HistoryItem format (browser-use pattern)
+                # Build HistoryItem format (browser pattern)
                 step_content_parts = []
                 
                 # Extract evaluation/memory/goal from previous think node if available
@@ -371,32 +382,78 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
                     results = step_entry.get("action_results", [])
                     
                     for result in results:
-                        # Browser-use pattern: prefer long_term_memory, fallback to extracted_content
+                        # browser pattern: prefer long_term_memory, fallback to extracted_content
                         long_term_memory = result.get("long_term_memory")
                         extracted_content = result.get("extracted_content")
                         include_only_once = result.get("include_extracted_content_only_once", False)
                         error = result.get("error")
                         
-                        # Handle read_state (extract() results) - browser-use pattern
+                        # Handle read_state (extract() results) - browser pattern
                         if include_only_once and extracted_content:
                             read_state_description += f'<read_state_{read_state_idx}>\n{extracted_content}\n</read_state_{read_state_idx}>\n'
                             read_state_idx += 1
                         
-                        # Build action_results text (browser-use pattern)
+                        # Build action_results text (browser pattern)
                         if long_term_memory:
                             action_results_text += f'{long_term_memory}\n'
                         elif extracted_content and not include_only_once:
-                            action_results_text += f'{extracted_content}\n'
+                            # Detect if extracted_content contains error-like messages
+                            # Some actions return error messages via extracted_content (e.g., "Element index X not available")
+                            error_indicators = [
+                                "not available",
+                                "not found",
+                                "failed",
+                                "error",
+                                "cannot",
+                                "unable",
+                                "invalid",
+                                "does not exist",
+                                "not available - page may have changed"
+                            ]
+                            is_error_message = any(indicator.lower() in extracted_content.lower() for indicator in error_indicators)
+                            
+                            if is_error_message:
+                                # Format as error so LLM recognizes it as a failure
+                                error_text = extracted_content[:200] + '......' + extracted_content[-100:] if len(extracted_content) > 200 else extracted_content
+                                action_results_text += f'Error: {error_text}\n'
+                            else:
+                                action_results_text += f'{extracted_content}\n'
                         
                         if error:
                             error_text = error[:200] + '......' + error[-100:] if len(error) > 200 else error
                             action_results_text += f'Error: {error_text}\n'
-                    
+
+                    # FORM INCOMPLETE WARNING: Add explicit instructions if form has issues
+                    form_incomplete = state.get("form_incomplete", False)
+                    form_state = state.get("form_state", {})
+                    validation_errors_count = state.get("validation_errors_count", 0)
+                    blocking_errors_count = state.get("blocking_errors_count", 0)
+
+                    if form_incomplete and (validation_errors_count > 0 or blocking_errors_count > 0):
+                        # Add explicit form completion warning
+                        incomplete_fields = form_state.get("required_empty_fields", [])
+                        validation_errors = form_state.get("validation_errors", [])
+
+                        form_warning = "\n⚠️ FORM INCOMPLETE - MUST FIX BEFORE PROCEEDING:\n"
+                        if validation_errors:
+                            form_warning += f"  • Validation errors: {'; '.join(validation_errors[:2])}\n"
+                        if incomplete_fields:
+                            field_labels = [f['label'] for f in incomplete_fields[:3]]
+                            form_warning += f"  • {len(incomplete_fields)} required fields still empty: {', '.join(field_labels)}"
+                            if len(incomplete_fields) > 3:
+                                form_warning += f", +{len(incomplete_fields)-3} more"
+                            form_warning += "\n"
+                        form_warning += "  • DO NOT click Submit or navigate away until form is complete\n"
+                        form_warning += "  • Review CURRENT <browser_state> to see correct field indices\n"
+                        form_warning += "  • Fix validation errors FIRST, then fill remaining required fields\n"
+
+                        action_results_text += form_warning
+
                     if action_results_text:
                         step_content_parts.append(f'Result\n{action_results_text.strip()}')
                 
                 # Add verification failure details (critical for retry - LLM needs to know WHY it failed)
-                # Browser-use pattern: On retry, LLM sees fresh browser_state with CURRENT element indices
+                # browser pattern: On retry, LLM sees fresh browser_state with CURRENT element indices
                 # LLM should analyze what's actually available NOW, not use stale indices from previous step
                 if node == "verify":
                     verification_status = step_entry.get("verification_status")
@@ -417,7 +474,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
                         
                         if failure_details:
                             step_content_parts.append(f'Result\n{"\n".join(failure_details)}')
-                            # Browser-use pattern: Guide LLM to use CURRENT browser_state (sent in this step)
+                            # browser pattern: Guide LLM to use CURRENT browser_state (sent in this step)
                             # Human QA approach: Look at what's on the page NOW, then pick the right element
                             step_content_parts.append("⚠️ RETRY: The previous action failed. Please review the CURRENT <browser_state> above to see what elements are actually available on this page. Element indices may have changed - use the indices shown in the current browser_state, not from previous steps.")
                 
@@ -430,7 +487,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
                         if extracted_content:
                             step_content_parts.append(f'Result\n{extracted_content}')
 
-                # Format as browser-use HistoryItem: <step_N>...</step_N>
+                # Format as browser HistoryItem: <step_N>...</step_N>
                 if step_content_parts:
                     content = '\n'.join(step_content_parts)
                     agent_history_description += f'<step_{step_num}>\n{content}\n</step_{step_num}>\n'
@@ -443,7 +500,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         # Clean up read_state_description
         read_state_description = read_state_description.strip('\n') if read_state_description else None
 
-        # Get page-filtered actions (browser-use pattern: show only relevant actions per page)
+        # Get page-filtered actions (browser pattern: show only relevant actions per page)
         page_filtered_actions = None
         try:
             from qa_agent.tools.service import Tools
@@ -452,29 +509,192 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         except Exception as e:
             logger.debug(f"Could not get page-filtered actions: {e}")
         
-        # Browser-use pattern: Don't add hard-coded guidance - just send the browser state
+        # browser pattern: Force done action after max_failures (service.py:902-913)
+        # Check if we've reached max consecutive failures
+        consecutive_failures = state.get("consecutive_failures", 0)
+        max_failures = state.get("max_failures", 3)
+        final_response_after_failure = state.get("final_response_after_failure", True)
+
+        # browser pattern: Don't add hard-coded guidance - just send the browser state
         # The LLM will analyze the current browser_state and decide actions based on what it sees
         # If we switched tabs, the browser_state already contains the new page's elements
         # The LLM can see all interactive elements and their indices, so it can adapt dynamically
         enhanced_task = task
+
+        # Force done action after max failures (browser pattern: service.py:905-913)
+        if consecutive_failures >= max_failures and final_response_after_failure:
+            logger.warning(f"🛑 Max consecutive failures reached ({consecutive_failures}/{max_failures}), forcing done action")
+            # Create forced done message (browser pattern)
+            force_done_msg = f'You failed {max_failures} times. Therefore we terminate the agent.\n'
+            force_done_msg += 'Your only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.\n'
+            force_done_msg += 'If the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.\n'
+            force_done_msg += 'Include everything you found out for the ultimate task in the done text.\n'
+            force_done_msg += f'\nOriginal task: {task}'
+            enhanced_task = force_done_msg
         
-        # Create file system for extract() action support
-        # Browser-use pattern: FileSystem handles saving extracted content to files
+        # Restore or create file system for extract() action support
+        # browser pattern: FileSystem handles saving extracted content to files
+        # CRITICAL: Persist FileSystem state across steps for todo.md tracking
         from qa_agent.filesystem.file_system import FileSystem
         from pathlib import Path
-        file_system_dir = Path("qa_agent_workspace") / f"session_{browser_session_id[:8]}"
-        file_system = FileSystem(base_dir=file_system_dir, create_default_files=True)
+        
+        # Restore FileSystem from state if it exists (Phase 1: FileSystem persistence)
+        file_system_state = state.get("file_system_state")
+        if file_system_state:
+            # Restore existing FileSystem from persisted state
+            file_system = FileSystem.from_state(file_system_state)
+            logger.debug("Restored FileSystem from state (todo.md preserved)")
+        else:
+            # Create new FileSystem on first step
+            # CRITICAL: Don't clean data_dir if it already exists (might have files from INIT)
+            file_system_dir = Path("qa_agent_workspace") / f"session_{browser_session_id[:8]}"
+            file_system = FileSystem(base_dir=file_system_dir, create_default_files=True, clean_data_dir=False)
+            logger.debug("Created new FileSystem (first step, preserving existing files)")
+
+        # Phase 3 + 4: Robust task context enhancement with conflict resolution
+        # Priority system: todo.md (PRIMARY) + goals (SECONDARY hints)
+        # This makes our QA agent better than browser by providing page state hints
+        # while maintaining LLM-driven task progression via todo.md
+        
+        # Start with original task
+        enhanced_task = task
+        
+        # Step 1: Build goal context (informational hints, not task modification)
+        goal_context = ""
+        if goals and (completed_goals or current_goal_index < len(goals)):
+            goal_context = "\n📊 PAGE STATE HINTS (informational - may not align with todo.md):\n"
+            if completed_goals:
+                goal_context += f"  ✅ Detected phases: {', '.join(completed_goals)}\n"
+            if current_goal_index < len(goals):
+                current_goal_obj = goals[current_goal_index]
+                goal_context += f"  📍 Current phase hint: {current_goal_obj.get('description', '')}\n"
+            goal_context += "  ⚠️ Note: These are page state detection hints. Task progression is tracked via todo.md below.\n"
+            goal_context += "  💡 If hints conflict with todo.md, trust todo.md (it's LLM-driven and more accurate).\n"
+        
+        # Step 2: Build todo.md context (PRIMARY - LLM-driven task progression)
+        todo_context = ""
+        if file_system and not (consecutive_failures >= max_failures and final_response_after_failure):
+            try:
+                todo_content = file_system.get_todo_contents()
+                # Check if todo.md is empty or just the default placeholder
+                is_empty = not todo_content or todo_content.strip() == '' or todo_content.strip() == '[empty todo.md, fill it when applicable]'
+                
+                if not is_empty:
+                    # Parse completed vs remaining items from todo.md (handle malformed checkboxes)
+                    import re
+                    completed_items = []
+                    remaining_items = []
+                    for line in todo_content.split('\n'):
+                        line_stripped = line.strip()
+                        
+                        # Handle malformed checkboxes (e.g., "- [x] - [ ]" should be cleaned)
+                        # Remove ALL checkbox patterns until we find the actual step text
+                        cleaned_line = line_stripped
+                        while re.match(r'^\s*-\s*\[[xX ]\]\s*', cleaned_line):
+                            cleaned_line = re.sub(r'^\s*-\s*\[[xX ]\]\s*', '', cleaned_line)
+                        
+                        # Check if this is a todo line (has checkbox pattern)
+                        if line_stripped.startswith('- [') and ('[ ]' in line_stripped or '[x]' in line_stripped or '[X]' in line_stripped):
+                            # Determine if completed or remaining based on checkbox state
+                            has_checked = '[x]' in line_stripped or '[X]' in line_stripped
+                            has_unchecked = '[ ]' in line_stripped
+                            
+                            # Extract item text (after removing all checkbox patterns)
+                            item_text = cleaned_line.strip()
+                            
+                            if item_text:
+                                # If it has checked checkbox and no unchecked, it's completed
+                                if has_checked and not has_unchecked:
+                                    completed_items.append(item_text)
+                                # If it has unchecked checkbox (even if also has checked - malformed), it's remaining
+                                elif has_unchecked:
+                                    remaining_items.append(item_text)
+                                # Edge case: if only checked exists, mark as completed
+                                elif has_checked:
+                                    completed_items.append(item_text)
+                    
+                    # Build todo.md context (PRIMARY)
+                    if completed_items or remaining_items:
+                        todo_context = "✅ TASK PROGRESSION (from todo.md - PRIMARY source):\n\n"
+                        
+                        if completed_items:
+                            todo_context += "✅ COMPLETED STEPS:\n"
+                            # Show max 5 completed items to avoid context overload
+                            for item in completed_items[:5]:
+                                todo_context += f"  ✓ {item}\n"
+                            if len(completed_items) > 5:
+                                todo_context += f"  ... and {len(completed_items) - 5} more completed\n"
+                            todo_context += "\n"
+                        
+                        if remaining_items:
+                            todo_context += "📍 REMAINING STEPS:\n"
+                            # Show max 10 remaining items
+                            for item in remaining_items[:10]:
+                                todo_context += f"  → {item}\n"
+                            if len(remaining_items) > 10:
+                                todo_context += f"  ... and {len(remaining_items) - 10} more remaining\n"
+                            todo_context += "\n"
+                        
+                        logger.info(f"Enhanced task context with todo.md progress: {len(completed_items)} completed, {len(remaining_items)} remaining")
+                    else:
+                        # todo.md exists but has no checklist items - might be malformed
+                        logger.warning("todo.md exists but has no checklist items - might be empty or malformed")
+                else:
+                    # todo.md is empty - INIT should have created it, but didn't
+                    logger.warning("todo.md is empty - INIT node should have created it. LLM will need to create it.")
+            except Exception as e:
+                # If todo.md parsing fails, just skip enhancement (don't break prompt)
+                logger.debug(f"Could not enhance task context with todo.md: {e}")
+        
+        # Phase 1: Add action context if available (shows which action caused new elements)
+        action_context = state.get("action_context")
+        action_context_text = ""
+        if action_context:
+            action_type = action_context.get("action_type", "unknown")
+            action_index = action_context.get("action_index")
+            new_elements_count = action_context.get("new_elements_count", 0)
+            
+            if new_elements_count > 0:
+                action_context_text = f"\n<action_context>\n"
+                action_context_text += f"Last action: {action_type}"
+                if action_index:
+                    action_context_text += f" on element {action_index}"
+                action_context_text += f"\nNew elements appeared: {new_elements_count} elements (marked with *[index])\n"
+                action_context_text += f"These elements are likely in a container opened by your last action.\n"
+                action_context_text += f"When multiple elements match your goal, prioritize these NEW elements.\n"
+                action_context_text += f"</action_context>\n"
+                logger.info(f"📊 Adding action context: {action_type} → {new_elements_count} new elements")
+        
+        # Step 3: Merge with priority (todo.md first, then action context, then goals, then full task)
+        if todo_context:
+            # Priority: todo.md context (PRIMARY)
+            enhanced_task = f"{todo_context}📋 FULL TASK (for reference):\n{task}"
+            if action_context_text:
+                # Add action context after todo (high priority for element selection)
+                enhanced_task = f"{todo_context}{action_context_text}📋 FULL TASK (for reference):\n{task}"
+            if goal_context:
+                # Add goal hints as secondary information
+                enhanced_task += goal_context
+        elif action_context_text:
+            # Fallback: Action context if no todo.md
+            enhanced_task = f"{action_context_text}{task}"
+            if goal_context:
+                enhanced_task += goal_context
+        elif goal_context:
+            # Fallback: Only goals if no todo.md or action context
+            enhanced_task = f"{task}{goal_context}"
+        # else: enhanced_task = task (no enhancement)
 
         # Create AgentMessagePrompt (uses BrowserStateSummary directly!)
         agent_message_prompt = AgentMessagePrompt(
             browser_state_summary=browser_state,  # Pass the actual BrowserStateSummary object
             file_system=file_system,  # FileSystem for extract() action and file operations
             agent_history_description=agent_history_description,
-            read_state_description=read_state_description,  # Extract() results (browser-use pattern)
+            read_state_description=read_state_description,  # Extract() results (browser pattern)
             task=enhanced_task,  # Use enhanced task with tab switch context if applicable
             include_attributes=None,  # Use default attributes
             step_info=step_info,
-            page_filtered_actions=page_filtered_actions,  # Page-specific actions (browser-use pattern)
+            page_filtered_actions=page_filtered_actions,  # Page-specific actions (browser pattern)
             max_clickable_elements_length=40000,
             sensitive_data=None,
             available_file_paths=None,
@@ -486,7 +706,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         )
 
         # Get formatted messages
-        # Browser-use pattern: AgentMessagePrompt.get_user_message() includes:
+        # browser pattern: AgentMessagePrompt.get_user_message() includes:
         # - <agent_history> with previous steps
         # - <agent_state> with user_request, step_info, etc.
         # - <browser_state> with FULL DOM structure via llm_representation() - ALL interactive elements with indices
@@ -497,7 +717,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         user_message = agent_message_prompt.get_user_message(use_vision=False)
         
         # Log that LLM is receiving full DOM structure (for debugging/verification)
-        # Browser-use pattern: AgentMessagePrompt includes FULL DOM via llm_representation()
+        # browser pattern: AgentMessagePrompt includes FULL DOM via llm_representation()
         # This gives LLM complete page structure BEFORE deciding actions - like human QA analyzes page first
         if browser_state.dom_state:
             try:
@@ -551,17 +771,17 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         }
 
         print(f"\n{'='*80}")
-        print(f"📤 SENDING TO LLM (Step {step_count}) - Using browser-use prompts")
+        print(f"📤 SENDING TO LLM (Step {step_count}) - Using browser prompts")
         print(f"{'='*80}")
-        print(f"\n📝 System Message (browser-use):\n{system_content[:500]}...")
-        print(f"\n💬 User Message (browser-use):\n{user_content[:500]}...")
+        print(f"\n📝 System Message (browser):\n{system_content[:500]}...")
+        print(f"\n💬 User Message (browser):\n{user_content[:500]}...")
         print(f"\n💾 Saving prompt to: {log_file}")
 
         # Initialize LLM and call
-        logger.info("Calling LLM to generate action plan with browser-use prompts...")
+        logger.info("Calling LLM to generate action plan with browser prompts...")
         llm = get_llm()
 
-        # Convert browser-use messages to LangChain format
+        # Convert browser messages to LangChain format
         from langchain_core.messages import SystemMessage as LCSystemMessage, HumanMessage
         langchain_messages = [
             LCSystemMessage(content=system_content),
@@ -571,7 +791,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         # Call LLM with structured output (LangChain pattern)
         from qa_agent.views import AgentOutput
 
-        # Create dynamic ActionModel with current page's actions (browser-use pattern)
+        # Create dynamic ActionModel with current page's actions (browser pattern)
         # This gives LLM precise schema of available actions
         action_model = tools.registry.create_action_model(page_url=current_url)
 
@@ -582,10 +802,32 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         logger.info(f"Using dynamic ActionModel with {len([a for a in tools.registry.registry.actions.keys()])} registered actions")
 
         # LangChain uses with_structured_output() method, NOT output_format parameter
-        structured_llm = llm.with_structured_output(dynamic_agent_output)
-        parsed: AgentOutput = await structured_llm.ainvoke(langchain_messages)
+        # Use function_calling method for OpenAI compatibility with complex nested schemas
+        structured_llm = llm.with_structured_output(dynamic_agent_output, method="function_calling")
+        raw_response = await structured_llm.ainvoke(langchain_messages)
+        
+        # browser pattern: Manually validate the response to match schema (chat_browser_use.py:178)
+        # LangChain's with_structured_output() may return dict or Pydantic model
+        # Convert to dict if needed, then validate against AgentOutput schema
+        try:
+            if isinstance(raw_response, dict):
+                # Already a dict - validate directly
+                completion_data = raw_response
+            else:
+                # Pydantic model or other object - convert to dict
+                completion_data = raw_response.model_dump() if hasattr(raw_response, 'model_dump') else dict(raw_response)
+            
+            # Validate against schema (browser pattern)
+            parsed: AgentOutput = dynamic_agent_output.model_validate(completion_data)
+        except Exception as e:
+            logger.error(f"Failed to validate LLM response against AgentOutput schema: {e}")
+            logger.error(f"Raw response type: {type(raw_response)}")
+            logger.error(f"Raw response value: {raw_response}")
+            # Re-raise as ValidationError to match browser pattern
+            from pydantic import ValidationError
+            raise ValidationError(f"LLM response validation failed: {e}") from e
 
-        logger.info(f"LLM response received: {parsed}")
+        logger.info(f"LLM response received and validated: {parsed}")
 
         # Save LLM response
         log_data["llm_response"] = {
@@ -606,13 +848,10 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         next_goal = parsed.next_goal
         thinking = parsed.thinking
 
-        # Convert ActionModel list to simple dict format for act node
-        # ActionModel.model_dump() returns {"click": {"index": 123}}
-        # convert_browser_use_actions() converts to {"action": "click", "index": 123}
-        from qa_agent.utils.response_parser import convert_browser_use_actions
-
-        action_dicts = [action_model.model_dump(exclude_unset=True) for action_model in parsed.action]
-        planned_actions = convert_browser_use_actions(action_dicts)
+        # parsed.action is already list[ActionModel] - use directly!
+        # LangChain with_structured_output() returns validated Pydantic objects
+        # No conversion needed - act node can use ActionModel objects directly
+        planned_actions = parsed.action
 
         logger.info(f"✅ Structured output: {len(planned_actions)} actions extracted")
         for i, action in enumerate(planned_actions, 1):
@@ -622,9 +861,9 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         # The LLM provider validates the response against the Pydantic schema
         
         logger.debug(f"Parsed {len(planned_actions)} actions: {planned_actions}")
-        
-        # Save parsed actions
-        log_data["parsed_actions"] = planned_actions
+
+        # Save parsed actions (convert ActionModel to dict for JSON serialization)
+        log_data["parsed_actions"] = [a.model_dump(exclude_unset=True) for a in planned_actions]
         log_data["extracted_fields"] = {
             "evaluation_previous_goal": evaluation_previous_goal,
             "memory": memory,
@@ -637,30 +876,32 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         for i, action in enumerate(planned_actions, 1):
             print(f"  {i}. {action}")
         
-        # Check for "done" action from LLM (supports both "action" and "type" keys)
-        # Filter out non-dict actions (parser may return strings from malformed responses)
+        # Check for "done" action from LLM
+        # planned_actions is list[ActionModel] - check using model_dump()
         has_done_action = any(
-            isinstance(action, dict) and (action.get("action") == "done" or action.get("type") == "done")
+            "done" in action.model_dump(exclude_unset=True)
             for action in planned_actions
         )
 
         # Get existing history early (needed for multiple return paths)
         existing_history = state.get("history", [])
 
-        # Browser-use pattern: Title and URL are ALREADY in browser_state (<browser_state>)
+        # browser pattern: Title and URL are ALREADY in browser_state (<browser_state>)
         # System prompt says: "Call extract only if the information you are looking for is not visible
         # in your <browser_state> otherwise always just use the needed text from the <browser_state>."
         # So if LLM tries to extract title/URL, auto-complete since they're already available
-        extract_actions = [a for a in planned_actions if isinstance(a, dict) and a.get("action") == "extract"]
+        extract_actions = [a for a in planned_actions if "extract" in a.model_dump(exclude_unset=True)]
         for extract_action in extract_actions:
-            query = str(extract_action.get("query", "")).lower()
+            action_dump = extract_action.model_dump(exclude_unset=True)
+            extract_params = action_dump.get("extract", {})
+            query = str(extract_params.get("query", "")).lower()
             # Check if query asks for title/URL (which are already in browser state)
             if ("title" in query and "url" in query) or ("page title" in query and "url" in query) or \
                (query == "extract the page title and url"):
                 # Check if we're on a valid page (not about:blank or empty)
                 if current_url and current_url not in ["about:blank", ""] and current_title:
                     logger.info("LLM wants to extract title/URL - these are already in browser_state, auto-completing")
-                    # Auto-complete with the current title and URL (browser-use pattern)
+                    # Auto-complete with the current title and URL (browser pattern)
                     done_message = f"Task completed. Page title: {current_title}, URL: {current_url}"
                     print(f"\n✅ Auto-completing: Title and URL are already in browser state - {done_message}")
                     logger.info(f"Auto-completed task: {done_message}")
@@ -691,17 +932,21 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         if has_done_action:
             done_action = next((
                 a for a in planned_actions
-                if a.get("action") == "done" or a.get("type") == "done"
+                if "done" in a.model_dump(exclude_unset=True)
             ), None)
-            done_message = done_action.get("text") or done_action.get("message", "Task completed") if done_action else "Task completed"
+            if done_action:
+                done_params = done_action.model_dump(exclude_unset=True).get("done", {})
+                done_message = done_params.get("text", "Task completed")
+            else:
+                done_message = "Task completed"
             print(f"\n✅ LLM signaled task completion: {done_message}")
             logger.info(f"LLM completed task: {done_message}")
             
-            # Save completion
-            log_data["validated_actions"] = planned_actions
+            # Save completion (convert ActionModel to dict for JSON serialization)
+            log_data["validated_actions"] = [a.model_dump(exclude_unset=True) for a in planned_actions]
             log_data["task_completed"] = True
             log_data["completion_message"] = done_message
-            
+
             with open(log_file, "w") as f:
                 json.dump(log_data, f, indent=2)
             
@@ -723,29 +968,24 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
                 "current_goal": f"Task completed: {done_message[:50]}",
             }
         
-        # Validate actions
-        valid_actions = []
-        for action in planned_actions:
-            if validate_action(action):
-                valid_actions.append(action)
-            else:
-                logger.warning(f"Invalid action skipped: {action}")
-                print(f"  ⚠️  Invalid action skipped: {action}")
-        
-        # Save validated actions
-        log_data["validated_actions"] = valid_actions
-        
+        # No validation needed - LangChain with_structured_output() already validated via Pydantic
+        # ActionModel objects are guaranteed to be valid by the Pydantic schema
+        valid_actions = planned_actions
+
+        # Save validated actions (convert to dicts for JSON serialization in logs)
+        log_data["validated_actions"] = [a.model_dump(exclude_unset=True) for a in valid_actions]
+
         if not valid_actions:
-            logger.error("No valid actions parsed from LLM response. This indicates an LLM parsing issue.")
-            print("\n❌ ERROR: No valid actions parsed from LLM response!")
-            
+            logger.error("No actions returned from LLM response.")
+            print("\n❌ ERROR: No actions returned from LLM response!")
+
             # Save error to log file
-            log_data["error"] = "No valid actions parsed"
+            log_data["error"] = "No actions parsed"
             with open(log_file, "w") as f:
                 json.dump(log_data, f, indent=2)
-            
+
             return {
-                "error": "Failed to parse valid actions from LLM response. Check LLM output format.",
+                "error": "No actions returned from LLM response.",
                 "step_count": step_count,
                 "planned_actions": [],
             }
@@ -768,7 +1008,7 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         logger.info(f"Generated {len(valid_actions)} planned actions")
         
         # Update history - create new list (LangGraph best practice: don't mutate state)
-        # Store structured fields for proper history formatting (browser-use HistoryItem format)
+        # Store structured fields for proper history formatting (browser HistoryItem format)
         existing_history = state.get("history", [])
         new_history_entry = {
             "step": step_count,
@@ -787,10 +1027,70 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
             # On retry, provide more context about current state
             current_goal = f"Retry step {step_count} - Current page: {current_title[:30]} ({current_url[:50]})"
             if valid_actions:
-                current_goal += f" - Next: {valid_actions[0].get('action', 'unknown')}"
+                first_action_dump = valid_actions[0].model_dump(exclude_unset=True)
+                action_name = list(first_action_dump.keys())[0] if first_action_dump else 'unknown'
+                current_goal += f" - Next: {action_name}"
         else:
-            current_goal = f"Executing step {step_count}: {valid_actions[0].get('reasoning', '')[:50] if valid_actions else ''}"
+            if valid_actions:
+                first_action_dump = valid_actions[0].model_dump(exclude_unset=True)
+                # Try to get reasoning from action params if available
+                action_params = list(first_action_dump.values())[0] if first_action_dump else {}
+                reasoning = action_params.get('reasoning', '') if isinstance(action_params, dict) else ''
+                current_goal = f"Executing step {step_count}: {reasoning[:50]}"
+            else:
+                current_goal = f"Executing step {step_count}"
         
+        # Action repetition detection (prevent infinite loops of same action)
+        # Compare current action with previous action from history
+        previous_action = None
+        if existing_history:
+            # Get most recent think node action (stored as ActionModel in state)
+            for entry in reversed(existing_history):
+                if entry.get("node") == "think" and entry.get("planned_actions"):
+                    prev_actions = entry["planned_actions"]
+                    previous_action = prev_actions[0] if prev_actions else None
+                    break
+
+        current_action = valid_actions[0] if valid_actions else None
+        action_repetition_count = state.get("action_repetition_count", 0)
+
+        # Check if repeating same action (same action type and same index)
+        if previous_action and current_action:
+            # Both are ActionModel objects - compare their dumps
+            prev_dump = previous_action.model_dump(exclude_unset=True) if hasattr(previous_action, 'model_dump') else previous_action
+            curr_dump = current_action.model_dump(exclude_unset=True)
+
+            # Get action name and index from both
+            prev_action_name = list(prev_dump.keys())[0] if prev_dump else None
+            curr_action_name = list(curr_dump.keys())[0] if curr_dump else None
+
+            if prev_action_name == curr_action_name:
+                prev_params = prev_dump.get(prev_action_name, {}) if isinstance(prev_dump, dict) else {}
+                curr_params = curr_dump.get(curr_action_name, {})
+                prev_index = prev_params.get('index') if isinstance(prev_params, dict) else None
+                curr_index = curr_params.get('index')
+
+                if prev_index is not None and prev_index == curr_index:
+                    action_repetition_count += 1
+                    logger.warning(f"⚠️ Action repeated {action_repetition_count} times: {curr_action_name} on index {curr_index}")
+
+                    # Force done if repeated 3+ times
+                    if action_repetition_count >= 3:
+                        logger.error(f"🛑 Action repeated {action_repetition_count} times, forcing completion")
+                        return {
+                            "error": f"Action '{curr_action_name}' on index {curr_index} repeated {action_repetition_count} times without success",
+                            "completed": True,
+                            "step_count": step_count,
+                        }
+                else:
+                    # Different index - reset counter
+                    action_repetition_count = 0
+            else:
+                # Different action - reset counter
+                action_repetition_count = 0
+        else:
+            action_repetition_count = 0
+
         # Clear tab switch flag after processing (so it doesn't persist to next step)
         state_updates = {
             "step_count": step_count,
@@ -802,8 +1102,12 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
             "previous_url": current_url,  # Track URL for next step to detect tab/URL changes
             "previous_element_count": len(selector_map),  # Track element count for dynamic loading detection
             # Goal tracking updates
-            "completed_goals": completed_goals,
+            # Note: completed_goals uses reducer (operator.add), so we return only NEW items
+            # The reducer will append them to the existing list automatically
+            "completed_goals": [new_completed_goal_id] if new_completed_goal_id else [],
             "current_goal_index": current_goal_index,
+            # Action repetition tracking
+            "action_repetition_count": action_repetition_count,
         }
         
         # Clear tab switch flags after processing
@@ -815,7 +1119,14 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         # Clear fresh_state_available flag after using it (so it doesn't persist)
         if fresh_state_available:
             state_updates["fresh_state_available"] = False
+            state_updates["fresh_browser_state_object"] = None  # Clear object to free memory
             state_updates["page_changed"] = False
+        
+        # CRITICAL: Persist FileSystem state for todo.md tracking (Phase 1)
+        # Save FileSystem state so it persists across steps
+        file_system_state = file_system.get_state()
+        state_updates["file_system_state"] = file_system_state
+        logger.debug("Saved FileSystem state (todo.md will persist)")
         
         return state_updates
     except Exception as e:

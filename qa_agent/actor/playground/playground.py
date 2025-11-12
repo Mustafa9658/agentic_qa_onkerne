@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Playground script to test the browser-use actor API.
+Playground script to test the browser actor API.
 
 This script demonstrates:
 - Starting a browser session
@@ -13,7 +13,7 @@ import asyncio
 import json
 import logging
 
-from browser_use import Browser
+from qa_agent.browser import BrowserSession as Browser
 
 # Configure logging to see what's happening
 logging.basicConfig(level=logging.INFO)
