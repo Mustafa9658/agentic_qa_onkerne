@@ -823,3 +823,179 @@ class DomService:
 				)
 
 		return pagination_buttons
+
+	@observe_debug(ignore_input=True, ignore_output=True, name='get_element_event_listeners')
+	async def get_element_event_listeners(self, backend_node_id: int) -> list[dict]:
+		"""
+		Get event listeners attached to an element.
+
+		Returns list of listener dicts with keys: type, useCapture, passive, once, handler
+
+		Args:
+			backend_node_id: Backend node ID of element
+
+		Returns:
+			List of event listener dictionaries
+		"""
+		try:
+			cdp_session = await self.browser_session.get_or_create_cdp_session()
+
+			# Resolve backend node ID to object ID
+			resolve_result = await cdp_session.cdp_client.send.DOM.resolveNode(
+				params={'backendNodeId': backend_node_id},
+				session_id=cdp_session.session_id
+			)
+
+			if not resolve_result or 'object' not in resolve_result:
+				return []
+
+			object_id = resolve_result['object']['objectId']
+
+			# Get event listeners
+			listeners_result = await cdp_session.cdp_client.send.DOMDebugger.getEventListeners(
+				params={'objectId': object_id},
+				session_id=cdp_session.session_id
+			)
+
+			if not listeners_result or 'listeners' not in listeners_result:
+				return []
+
+			return listeners_result['listeners']
+
+		except Exception as e:
+			self.logger.debug(f'Failed to get event listeners for node {backend_node_id}: {e}')
+			return []
+
+	async def get_tab_order_elements(
+		self,
+		target_id: TargetID
+	) -> list[EnhancedDOMTreeNode]:
+		"""Get form elements in tab order."""
+		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=target_id)
+		
+		# Use JavaScript to get elements in tab order
+		tab_order_script = """
+		(function() {
+			const formElements = [];
+			const seen = new Set();
+			
+			// Get all focusable elements
+			const focusableSelectors = [
+				'input:not([type="hidden"]):not([disabled])',
+				'textarea:not([disabled])',
+				'select:not([disabled])',
+				'button:not([disabled])',
+				'a[href]',
+				'[tabindex]:not([tabindex="-1"])'
+			];
+			
+			const allElements = document.querySelectorAll(focusableSelectors.join(', '));
+			
+			// Sort by tabIndex (0 comes after positive tabIndex)
+			const sorted = Array.from(allElements).sort((a, b) => {
+				const aTabIndex = parseInt(a.getAttribute('tabindex') || '0') || 0;
+				const bTabIndex = parseInt(b.getAttribute('tabindex') || '0') || 0;
+				
+				if (aTabIndex > 0 && bTabIndex > 0) {
+					return aTabIndex - bTabIndex;
+				}
+				if (aTabIndex > 0) return -1;
+				if (bTabIndex > 0) return 1;
+				
+				// Both are 0 or negative, maintain DOM order
+				return 0;
+			});
+			
+			// Get DOM order for elements with tabIndex 0
+			const domOrder = Array.from(document.querySelectorAll('*'));
+			
+			const result = [];
+			for (const el of sorted) {
+				if (seen.has(el)) continue;
+				seen.add(el);
+				
+				// Get backend node ID - we'll need to resolve this
+				// Store element info for later resolution
+				result.push({
+					tagName: el.tagName.toLowerCase(),
+					type: el.type || '',
+					name: el.name || '',
+					id: el.id || '',
+					tabIndex: parseInt(el.getAttribute('tabindex') || '0') || 0,
+					xpath: getXPath(el)
+				});
+			}
+			
+			// Helper function to get XPath
+			function getXPath(element) {
+				if (element.id !== '') {
+					return 'id("' + element.id + '")';
+				}
+				if (element === document.body) {
+					return '/html/body';
+				}
+				let ix = 0;
+				const siblings = element.parentNode.childNodes;
+				for (let i = 0; i < siblings.length; i++) {
+					const sibling = siblings[i];
+					if (sibling === element) {
+						return getXPath(element.parentNode) + '/' + element.tagName.toLowerCase() + '[' + (ix + 1) + ']';
+					}
+					if (sibling.nodeType === 1 && sibling.tagName === element.tagName) {
+						ix++;
+					}
+				}
+			}
+			
+			return result;
+		})()
+		"""
+		
+		result = await cdp_session.cdp_client.send.Runtime.evaluate(
+			params={'expression': tab_order_script, 'returnByValue': True},
+			session_id=cdp_session.session_id
+		)
+		
+		elements = result.get('result', {}).get('value', [])
+		
+		# Get DOM tree to find nodes
+		dom_tree = await self.get_dom_tree(target_id)
+		
+		# Helper function to find node by XPath or attributes
+		def find_node_by_info(dom_node: EnhancedDOMTreeNode, elem_info: dict) -> EnhancedDOMTreeNode | None:
+			"""Find node matching element info."""
+			# Try ID first
+			if elem_info['id']:
+				if dom_node.attributes.get('id') == elem_info['id']:
+					return dom_node
+			
+			# Try name
+			if elem_info['name']:
+				if dom_node.attributes.get('name') == elem_info['name']:
+					return dom_node
+			
+			# Try tag and type
+			if dom_node.tag_name == elem_info['tagName']:
+				if elem_info['type']:
+					if dom_node.attributes.get('type') == elem_info['type']:
+						return dom_node
+				else:
+					return dom_node
+			
+			# Recursively check children
+			if dom_node.children_nodes:
+				for child in dom_node.children_nodes:
+					found = find_node_by_info(child, elem_info)
+					if found:
+						return found
+			
+			return None
+		
+		tab_order_nodes = []
+		for elem_info in elements:
+			# Find node in DOM tree
+			node = find_node_by_info(dom_tree, elem_info)
+			if node:
+				tab_order_nodes.append(node)
+		
+		return tab_order_nodes

@@ -1,15 +1,16 @@
 import asyncio
 
-from browser_use import Agent, Browser, ChatOpenAI
+from qa_agent.browser import BrowserSession as Browser
+from qa_agent.llm import get_llm
 
-llm = ChatOpenAI('gpt-4.1-mini')
+llm = get_llm(model='gpt-4o-mini')
 
 
 async def main():
 	"""
-	Main function demonstrating mixed automation with Browser-Use and Playwright.
+	Main function demonstrating mixed automation with browser and Playwright.
 	"""
-	print('🚀 Mixed Automation with Browser-Use and Actor API')
+	print('🚀 Mixed Automation with browser and Actor API')
 
 	browser = Browser(keep_alive=True)
 	await browser.start()
@@ -29,8 +30,9 @@ async def main():
 
 	await asyncio.sleep(1)
 
-	agent = Agent(task='Find the cheapest flight from London to Paris on 2025-10-15', llm=llm, browser_session=browser)
-	await agent.run()
+	# Note: Agent class doesn't exist in onkernal - use workflow instead
+	# For this playground example, we'll just demonstrate browser interactions
+	print('Note: Agent.run() is not available in onkernal. Use workflow.run() instead for full agent functionality.')
 
 	input('Press Enter to continue...')
 
