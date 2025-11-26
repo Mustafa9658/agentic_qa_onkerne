@@ -4,10 +4,10 @@ LangGraph Nodes for QA Automation Workflow
 Hierarchical Architecture (Phase 3 - THINK → ACT):
 - init: Initialize browser session and create todo.md
 - plan: Decompose complex tasks into sequential goals (LLM-driven)
-- think: Minimal THINK node - strategic decision only (~300 tokens)
+- think: Minimal THINK node - strategic decision only + todo.md updates (~300 tokens)
 - act: ACT wrapper with page validation - executes THINK output with fresh DOM (~1500 tokens)
-- verify: Verify action results (lightweight, mainly for tab switching)
 - report: Generate final report
+- verify: (Legacy) Kept for backward compatibility, not used in main workflow
 
 THINK Characteristics:
   - Input: task + todo.md + previous ACT feedback

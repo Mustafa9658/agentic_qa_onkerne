@@ -82,6 +82,69 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
 			logger.warning("⚠️  No todo.md yet - INIT should create it, but continuing...")
 			todo_contents = f"## Goal\n{task}\n\n## Tasks:\n- [ ] Complete the task\n"
 
+		# ===== 2.5. UPDATE TODO.MD FROM PREVIOUS ACT RESULT =====
+		# THINK owns todo lifecycle: read → update → plan
+		# This keeps ACT focused purely on execution
+		executed_actions = state.get("executed_actions", [])
+		last_success = state.get("last_act_result_success", False)
+
+		if last_success and executed_actions:
+			try:
+				import re
+				from qa_agent.utils.llm_todo_updater import llm_match_actions_to_todo_steps
+				from qa_agent.llm import get_llm
+
+				todo_lines = todo_contents.split('\n')
+				todo_steps = []
+
+				# Parse current todo steps
+				for line in todo_lines:
+					line_stripped = line.strip()
+					if line_stripped.startswith('- [ ]') or line_stripped.startswith('- [x]') or line_stripped.startswith('- [X]'):
+						step_text = re.sub(r'^- \[[xX ]\]\s*', '', line_stripped)
+						if step_text:
+							todo_steps.append(step_text)
+
+				if todo_steps:
+					logger.info(f"📝 THINK: Updating todo - matching {len(executed_actions)} actions to {len(todo_steps)} steps")
+
+					# Use LLM to intelligently match actions to steps
+					todo_llm = get_llm()
+					completed_indices = await llm_match_actions_to_todo_steps(
+						executed_actions=executed_actions,
+						todo_steps=todo_steps,
+						llm=todo_llm,
+					)
+
+					# Update todo.md with completed steps
+					if completed_indices:
+						steps_marked = 0
+						for step_idx in completed_indices:
+							if step_idx < len(todo_steps):
+								step_text = todo_steps[step_idx]
+
+								# Find and update the line in todo_contents
+								for i, line in enumerate(todo_lines):
+									line_stripped = line.strip()
+									if (line_stripped.startswith('- [ ]') and step_text.strip() in line_stripped):
+										# Mark as complete
+										old_checkbox = '- [ ]'
+										new_checkbox = '- [x]'
+										todo_lines[i] = line_stripped.replace(old_checkbox, new_checkbox, 1)
+										steps_marked += 1
+										logger.info(f"✅ THINK: Marked step complete: {step_text[:50]}")
+										break
+
+						if steps_marked > 0:
+							# Rebuild todo_contents
+							todo_contents = '\n'.join(todo_lines)
+							# Save to file
+							result = await file_system.write_file("todo.md", todo_contents)
+							logger.info(f"✅ THINK: Updated todo.md with {steps_marked} completed step(s)")
+			except Exception as e:
+				logger.warning(f"⚠️  THINK: Could not update todo.md: {e}")
+				# Continue - todo update is nice-to-have but don't block planning
+
 		# Get progress
 		progress = get_todo_progress(todo_contents)
 		logger.info(f"📊 Todo Progress: {progress['completed']}/{progress['total']} steps completed")
