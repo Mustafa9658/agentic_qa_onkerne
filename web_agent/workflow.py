@@ -17,10 +17,11 @@ def should_continue_after_think(state: QAAgentState) -> Literal["continue", "don
     """
     Router function to determine next node after think.
 
-    Hierarchical Architecture (Phase 3):
-    - THINK outputs: think_output (strategic decision, no actions)
-    - If think_output exists and task not done → continue to ACT
-    - If task completed → done (go to report)
+    Computer-Use Architecture:
+    - THINK outputs: planned_actions (direct action list from full DOM analysis)
+    - If planned_actions exist → continue to ACT for execution
+    - If goal transition (no actions but more goals) → replan (loop to THINK)
+    - If task completed or no more actions/goals → done (go to report)
     - Error handling with max failures
 
     Args:
@@ -56,14 +57,22 @@ def should_continue_after_think(state: QAAgentState) -> Literal["continue", "don
             logger.warning(f"⏸️  Max steps reached: {step_count}/{max_steps}")
             return "done"
 
-        # Hierarchical flow: Check if THINK produced a strategic decision
-        think_output = state.get("think_output")
-        if think_output:
-            logger.info(f"📋 THINK Decision: {think_output} → routing to ACT")
+        # Computer-use flow: Check if THINK generated planned actions
+        planned_actions = state.get("planned_actions", [])
+        if planned_actions:
+            logger.info(f"📋 THINK generated {len(planned_actions)} planned actions → routing to ACT")
             return "continue"  # Go to ACT for execution
 
-        # No think_output and no error = something went wrong
-        logger.warning("⚠️  No think_output generated")
+        # Check if this is a goal transition (empty actions but more goals to do)
+        goals = state.get("goals", [])
+        current_goal_index = state.get("current_goal_index", 0)
+        if goals and current_goal_index < len(goals):
+            # Goal transition - loop back to think for next goal
+            logger.info("Goal transition detected, looping back to THINK for next goal")
+            return "replan"
+
+        # No actions planned and no more goals = done
+        logger.warning("⚠️  No planned actions and no more goals")
         return "done"
 
     except Exception as e:

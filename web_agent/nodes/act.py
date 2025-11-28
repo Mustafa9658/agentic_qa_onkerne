@@ -585,17 +585,30 @@ def convert_to_action_model(action_dict: Dict[str, Any], ActionModelClass: type 
 			return ActionModelClass(close_tab=CloseTabAction(tab_id=str(tab_id)))
 
 		elif action_type == "extract":
-			# browser extract requires a non-empty query string
-			query = str(action_dict.get("query", "")).strip()
+			# Handle both direct and params-wrapped formats
+			# Direct: {"action": "extract", "query": "..."}
+			# Wrapped: {"action": "extract", "params": {"query": "..."}}
+			params_dict = action_dict.get("params", {})
+			if params_dict:
+				# Params-wrapped format from registry
+				query = str(params_dict.get("query", "")).strip()
+				extract_links = params_dict.get("extract_links", False)
+				start_from_char = params_dict.get("start_from_char", 0)
+			else:
+				# Direct format (legacy/manual)
+				query = str(action_dict.get("query", "")).strip()
+				extract_links = action_dict.get("extract_links", False)
+				start_from_char = action_dict.get("start_from_char", 0)
+
 			if not query:
 				logger.warning("Extract action requires a non-empty query string")
 				return None
-			
+
 			# Get param model from registry (browser pattern)
 			if registry and "extract" in registry.registry.actions:
 				extract_action_info = registry.registry.actions["extract"]
 				param_model = extract_action_info.param_model
-				
+
 				# browser registry creates param_model from function signature
 				# Since extract() has params: ExtractAction as first param, the model expects:
 				# extract_Params(params: ExtractAction)
@@ -603,8 +616,8 @@ def convert_to_action_model(action_dict: Dict[str, Any], ActionModelClass: type 
 				from web_agent.tools.views import ExtractAction
 				extract_action = ExtractAction(
 					query=query,
-					extract_links=bool(action_dict.get("extract_links", False)),
-					start_from_char=int(action_dict.get("start_from_char", 0)),
+					extract_links=bool(extract_links),
+					start_from_char=int(start_from_char),
 				)
 				
 				# Check if param_model expects a 'params' field (registry-inferred pattern)
@@ -621,31 +634,39 @@ def convert_to_action_model(action_dict: Dict[str, Any], ActionModelClass: type 
 						logger.warning(f"Could not create extract param_model: {e}, using ExtractAction directly")
 						return ActionModelClass(extract=extract_action)
 			else:
-				# Fallback to our ExtractAction
-				extract_links = action_dict.get("extract_links", False)
-				start_from_char = action_dict.get("start_from_char", 0)
+				# Fallback to our ExtractAction (using variables extracted above)
 				return ActionModelClass(extract=ExtractAction(query=query, extract_links=bool(extract_links), start_from_char=int(start_from_char)))
 
 		elif action_type == "search":
-			query = action_dict.get("query", "")
-			engine = action_dict.get("engine", "duckduckgo")
+			# Handle both direct and params-wrapped formats
+			params_dict = action_dict.get("params", {})
+			if params_dict:
+				query = params_dict.get("query", "")
+				engine = params_dict.get("engine", "duckduckgo")
+			else:
+				query = action_dict.get("query", "")
+				engine = action_dict.get("engine", "duckduckgo")
 			return ActionModelClass(search=SearchAction(query=str(query), engine=engine))
 
 		elif action_type == "wait":
+			# Handle both direct and params-wrapped formats
+			params_dict = action_dict.get("params", {})
+			if params_dict:
+				seconds = int(params_dict.get("seconds", 3))
+			else:
+				seconds = int(action_dict.get("seconds", 3))
+
 			# Get param model from registry (browser pattern)
 			if registry and "wait" in registry.registry.actions:
 				wait_action_info = registry.registry.actions["wait"]
 				param_model = wait_action_info.param_model
-				# Create params dict
-				params_dict = {"seconds": int(action_dict.get("seconds", 3))}
 				# Validate and create param instance
-				validated_params = param_model(**params_dict)
+				validated_params = param_model(seconds=seconds)
 				return ActionModelClass(wait=validated_params)
 			else:
 				# Fallback to our WaitAction
 				from web_agent.tools.views import WaitAction
-				seconds = action_dict.get("seconds", 3)
-				return ActionModelClass(wait=WaitAction(seconds=int(seconds)))
+				return ActionModelClass(wait=WaitAction(seconds=seconds))
 
 		elif action_type == "screenshot":
 			from web_agent.tools.views import NoParamsAction
@@ -723,11 +744,18 @@ def convert_to_action_model(action_dict: Dict[str, Any], ActionModelClass: type 
 			if registry and action_type in registry.registry.actions:
 				action_info = registry.registry.actions[action_type]
 				param_model = action_info.param_model
-				
-				# Extract params from action_dict (excluding special params)
-				special_params = {"browser_session", "file_system", "available_file_paths", "page_extraction_llm"}
-				params_dict = {k: v for k, v in action_dict.items() if k not in special_params and k != "action"}
-				
+
+				# Handle both direct and params-wrapped formats
+				# Direct: {"action": "read_file", "path": "..."}
+				# Wrapped: {"action": "read_file", "params": {"path": "..."}}
+				if "params" in action_dict and isinstance(action_dict["params"], dict):
+					# Params-wrapped format from registry
+					params_dict = action_dict["params"]
+				else:
+					# Direct format - extract params from action_dict (excluding special params)
+					special_params = {"browser_session", "file_system", "available_file_paths", "page_extraction_llm", "action"}
+					params_dict = {k: v for k, v in action_dict.items() if k not in special_params}
+
 				try:
 					# Validate and create param instance
 					validated_params = param_model(**params_dict)
