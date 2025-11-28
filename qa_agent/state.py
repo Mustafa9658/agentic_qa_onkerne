@@ -93,6 +93,10 @@ class QAAgentState(TypedDict):
     final_response_after_failure: bool  # Allow final attempt after max failures
     action_repetition_count: int  # Count of repeated actions
     
+    # ========== Fallback Advisor ==========
+    fallback_advice_used: bool  # Whether fallback advisor was used
+    fallback_advice: Optional[Dict[str, Any]]  # Fallback advisor analysis result
+    
     # ========== Completion ==========
     completed: bool  # Task completion flag
     report: Optional[Dict[str, Any]]  # Final report
@@ -204,6 +208,10 @@ def create_initial_state(
         "max_failures": max_failures,  # From config, not hardcoded
         "final_response_after_failure": True,  # browser default
         "action_repetition_count": 0,
+        
+        # Fallback Advisor
+        "fallback_advice_used": False,
+        "fallback_advice": None,
         
         # Completion
         "completed": False,

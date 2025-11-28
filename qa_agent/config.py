@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     gemini_api_key: Optional[str] = None
     gemini_model: Optional[str] = None
 
+    # Gemini Fallback Advisor Settings
+    enable_gemini_fallback: bool = True
+    gemini_computer_use_model: str = "gemini-2.5-flash"  # Latest Flash model (fast, cost-effective, available on free tier)
+    fallback_trigger_repetition: int = 2  # Trigger after 2 repetitions, before forcing at 3
+    fallback_trigger_failures: int = 2  # Trigger after 2 failures, before max failures
+    fallback_trigger_same_page_steps: int = 10  # Trigger if same page for 10+ steps
+
     # Browser Settings (CDP & browser)
     headless: bool = False  # Set to False for headful browser (kernel-docker container)
     browser_timeout: int = 30000  # milliseconds

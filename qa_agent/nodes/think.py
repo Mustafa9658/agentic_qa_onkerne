@@ -497,6 +497,130 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         if tab_switch_system_message:
             agent_history_description += f'\n{tab_switch_system_message}\n'
 
+        # ========== GEMINI FALLBACK ADVISOR: Check if stuck and get advice ==========
+        # CRITICAL: This happens BEFORE the prompt is built so advice can be included in the LLM context
+        # We use the state's repetition count (from previous step) to detect if we're stuck
+        fallback_advice = None
+        
+        if settings.enable_gemini_fallback:
+            # Check stuck conditions using state values (from previous step)
+            action_repetition = state.get("action_repetition_count", 0)
+            consecutive_failures = state.get("consecutive_failures", 0)
+            previous_url = state.get("previous_url")
+            
+            # Trigger conditions (using state values - will be updated after this step)
+            should_use_fallback = (
+                action_repetition >= settings.fallback_trigger_repetition or
+                consecutive_failures >= settings.fallback_trigger_failures or
+                (step_count >= settings.fallback_trigger_same_page_steps and 
+                 current_url == previous_url and previous_url is not None)
+            )
+            
+            if should_use_fallback:
+                logger.warning(f"⚠️ Agent appears stuck - calling Gemini Fallback Advisor...")
+                logger.info(f"   Action repetition: {action_repetition}, Failures: {consecutive_failures}, Step: {step_count}")
+                logger.info(f"   Current URL: {current_url}")
+                
+                try:
+                    from qa_agent.llm.gemini_fallback_advisor import GeminiFallbackAdvisor
+                    gemini_advisor = GeminiFallbackAdvisor()
+                    
+                    # Get screenshot from live browser session (OnKernel browser)
+                    # CRITICAL: Always take fresh screenshot from the actual browser session
+                    # This ensures we get the current state of the OnKernel browser
+                    screenshot_b64 = None
+                    try:
+                        logger.info("📸 Capturing screenshot from live OnKernel browser session for Gemini fallback...")
+                        logger.info(f"   Browser session ID: {browser_session_id[:16]}...")
+                        logger.info(f"   Current URL: {current_url}")
+                        
+                        # Method 1: Use browser_session.take_screenshot() - direct CDP call
+                        # This captures from the actual live browser via CDP (OnKernel browser)
+                        screenshot_bytes = await browser_session.take_screenshot(
+                            format='png',  # PNG for better quality for vision model
+                            full_page=False  # Viewport only (faster, usually sufficient for analysis)
+                        )
+                        import base64
+                        screenshot_b64 = base64.b64encode(screenshot_bytes).decode('utf-8')
+                        logger.info(f"✅ Screenshot captured from live browser: {len(screenshot_bytes)} bytes ({len(screenshot_b64)} chars base64)")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Direct screenshot capture failed: {e}, trying alternative method...")
+                        # Method 2: Get browser state with screenshot included
+                        try:
+                            logger.info("📸 Trying alternative: getting browser state with screenshot...")
+                            browser_state_with_screenshot = await browser_session.get_browser_state_summary(
+                                include_screenshot=True,  # Request screenshot this time
+                                cached=False  # Get fresh state
+                            )
+                            if browser_state_with_screenshot and browser_state_with_screenshot.screenshot:
+                                screenshot_b64 = browser_state_with_screenshot.screenshot
+                                # Remove data: prefix if present (browser state returns with prefix)
+                                if screenshot_b64.startswith("data:image"):
+                                    screenshot_b64 = screenshot_b64.split(",")[1]
+                                logger.info(f"✅ Got screenshot from browser_state: {len(screenshot_b64)} chars (base64)")
+                            else:
+                                logger.warning("⚠️ browser_state.screenshot is None or empty")
+                        except Exception as e2:
+                            logger.error(f"❌ Alternative screenshot method also failed: {e2}")
+                            import traceback
+                            logger.debug(traceback.format_exc())
+                    
+                    if screenshot_b64:
+                        # Get recent actions from history
+                        recent_actions = []
+                        for entry in reversed(history[-10:]):
+                            if isinstance(entry, dict) and entry.get("executed_actions"):
+                                recent_actions.extend(entry["executed_actions"])
+                        
+                        # Prepare browser state summary for Gemini advisor
+                        browser_state_dict = {
+                            "url": current_url,
+                            "title": current_title,
+                            "element_count": len(selector_map) if selector_map else 0,
+                            "visible_elements": len(selector_map) if selector_map else 0,
+                        }
+                        # Add more info from browser_state if available
+                        if browser_state:
+                            browser_state_dict["url"] = browser_state.url
+                            browser_state_dict["title"] = browser_state.title
+                            if hasattr(browser_state, 'dom_state') and browser_state.dom_state:
+                                if hasattr(browser_state.dom_state, 'selector_map'):
+                                    browser_state_dict["element_count"] = len(browser_state.dom_state.selector_map)
+                        
+                        # Call Gemini advisor with live screenshot and context
+                        logger.info(f"🔍 Calling Gemini Fallback Advisor with live browser screenshot...")
+                        fallback_advice = await gemini_advisor.analyze_and_advise(
+                            task=task,
+                            screenshot_b64=screenshot_b64,
+                            current_url=current_url,
+                            recent_actions=recent_actions[-5:],  # Last 5 actions
+                            browser_state_summary=browser_state_dict,
+                        )
+                        
+                        logger.info(f"✅ Gemini Fallback Advisor provided advice")
+                        logger.info(f"   Diagnosis: {fallback_advice.get('diagnosis', 'Unknown')[:100]}")
+                        logger.info(f"   Suggestions: {len(fallback_advice.get('suggested_actions', []))}")
+                    else:
+                        logger.warning("No screenshot available for Gemini fallback advisor")
+                        
+                except Exception as e:
+                    logger.error(f"❌ Gemini Fallback Advisor failed: {e}")
+                    import traceback
+                    logger.debug(traceback.format_exc())
+                    # Continue without fallback advice - don't block main agent
+        
+        # Add Gemini Fallback Advisor analysis to prompt if available
+        if fallback_advice:
+            try:
+                from qa_agent.llm.gemini_fallback_advisor import GeminiFallbackAdvisor
+                gemini_advisor = GeminiFallbackAdvisor()
+                advisor_text = gemini_advisor.format_advice_for_prompt(fallback_advice)
+                agent_history_description += f'\n{advisor_text}\n'
+                logger.info("📋 Added Gemini Fallback Advisor analysis to OpenAI agent context")
+            except Exception as e:
+                logger.error(f"Failed to format fallback advice: {e}")
+        # ========== END GEMINI FALLBACK ADVISOR ==========
+
         # Clean up read_state_description
         read_state_description = read_state_description.strip('\n') if read_state_description else None
 
@@ -1110,6 +1234,9 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
             "current_goal_index": current_goal_index,
             # Action repetition tracking
             "action_repetition_count": action_repetition_count,
+            # Fallback advisor tracking
+            "fallback_advice_used": fallback_advice is not None,
+            "fallback_advice": fallback_advice,
         }
         
         # Clear tab switch flags after processing
