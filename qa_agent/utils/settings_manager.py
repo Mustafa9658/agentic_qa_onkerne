@@ -95,6 +95,15 @@ class SettingsManager:
             "fallback_trigger_same_page_steps": settings.fallback_trigger_same_page_steps,
         }
         
+        # Browser Settings (OnKernel connection)
+        self._browser_settings: Dict[str, Any] = {
+            "connection_type": "localhost",  # "localhost" or "api"
+            "kernel_cdp_host": settings.kernel_cdp_host,
+            "kernel_cdp_port": settings.kernel_cdp_port,
+            "api_key": settings.kernel_api_key,  # OnKernel API key (optional, only for API mode)
+            "api_endpoint": settings.kernel_api_endpoint,  # OnKernel API endpoint (default: https://api.onkernel.com)
+        }
+        
         logger.info("SettingsManager initialized with defaults from config")
     
     def get_llm_config(self) -> Dict[str, Any]:
@@ -243,16 +252,99 @@ class SettingsManager:
             raise ValueError(f"Invalid provider: {provider}. Must be one of {list(AVAILABLE_MODELS.keys())}")
         return AVAILABLE_MODELS[provider_lower].copy()
     
+    def get_browser_config(self) -> Dict[str, Any]:
+        """
+        Get current browser configuration
+        
+        Returns:
+            Dict with connection_type, kernel_cdp_host, kernel_cdp_port, api_key, api_endpoint
+        """
+        # Return copy without exposing API key in full (mask it)
+        config = self._browser_settings.copy()
+        if config.get("api_key"):
+            config["api_key"] = "***" + config["api_key"][-4:] if len(config["api_key"]) > 4 else "***"
+        return config
+    
+    def get_browser_config_raw(self) -> Dict[str, Any]:
+        """
+        Get current browser configuration with full API key (for internal use)
+        
+        Returns:
+            Dict with all browser settings including unmasked API key
+        """
+        return self._browser_settings.copy()
+    
+    def update_browser_settings(
+        self,
+        connection_type: Optional[str] = None,
+        kernel_cdp_host: Optional[str] = None,
+        kernel_cdp_port: Optional[int] = None,
+        api_key: Optional[str] = None,
+        api_endpoint: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Update browser settings
+        
+        Args:
+            connection_type: "localhost" or "api" (default: "localhost")
+            kernel_cdp_host: Host for localhost mode (default: "localhost")
+            kernel_cdp_port: Port for localhost mode (default: 9222)
+            api_key: OnKernel API key (required for API mode)
+            api_endpoint: OnKernel API endpoint URL (optional, defaults to standard endpoint)
+            
+        Returns:
+            Updated browser settings dict (with masked API key)
+            
+        Raises:
+            ValueError: If settings are invalid
+        """
+        if connection_type is not None:
+            connection_type_lower = connection_type.lower()
+            if connection_type_lower not in ["localhost", "api"]:
+                raise ValueError(f"Invalid connection_type: {connection_type}. Must be 'localhost' or 'api'")
+            self._browser_settings["connection_type"] = connection_type_lower
+            
+            # If switching to API mode, validate API key is provided
+            if connection_type_lower == "api" and api_key is None and not self._browser_settings.get("api_key"):
+                raise ValueError("API key is required when using API connection type")
+        
+        if kernel_cdp_host is not None:
+            if not kernel_cdp_host.strip():
+                raise ValueError("kernel_cdp_host cannot be empty")
+            self._browser_settings["kernel_cdp_host"] = kernel_cdp_host.strip()
+        
+        if kernel_cdp_port is not None:
+            if not (1 <= kernel_cdp_port <= 65535):
+                raise ValueError("kernel_cdp_port must be between 1 and 65535")
+            self._browser_settings["kernel_cdp_port"] = int(kernel_cdp_port)
+        
+        if api_key is not None:
+            if not api_key.strip():
+                raise ValueError("api_key cannot be empty")
+            self._browser_settings["api_key"] = api_key.strip()
+        
+        if api_endpoint is not None:
+            endpoint = api_endpoint.strip()
+            if endpoint:
+                # Basic URL validation
+                if not (endpoint.startswith("http://") or endpoint.startswith("https://")):
+                    raise ValueError("api_endpoint must be a valid HTTP/HTTPS URL")
+            self._browser_settings["api_endpoint"] = endpoint
+        
+        logger.info(f"Updated browser settings: connection_type={self._browser_settings['connection_type']}")
+        return self.get_browser_config()
+    
     def get_all_settings(self) -> Dict[str, Any]:
         """
         Get all runtime settings (for API response)
         
         Returns:
-            Dict with llm_settings and fallback_settings
+            Dict with llm_settings, fallback_settings, and browser_settings
         """
         return {
             "llm_settings": self.get_llm_config(),
             "fallback_settings": self.get_fallback_config(),
+            "browser_settings": self.get_browser_config(),
         }
 
 

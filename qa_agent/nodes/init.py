@@ -99,6 +99,10 @@ def _extract_url_from_task(task: str) -> Optional[str]:
 async def init_node(state: QAAgentState) -> Dict[str, Any]:
 	"""Initialize browser session for the workflow.
 
+	For API mode: Reuses persistent session from Live Preview if available (preserves cookies/login).
+	For localhost mode: Connects to existing browser instance (same behavior as before).
+	If no persistent session available: Creates new browser session.
+
 	Args:
 		state: Current workflow state (may contain start_url or task with URL)
 
@@ -117,21 +121,98 @@ async def init_node(state: QAAgentState) -> Dict[str, Any]:
 				start_url = extracted_url
 				logger.info(f"INIT: Extracted URL from task: {start_url}")
 
-	# Create browser session (this connects to kernel-image CDP)
-	logger.info(f"INIT: Creating browser session{' with start_url=' + start_url if start_url else ''}")
-	session_id, session = await create_browser_session(start_url=start_url)
+	# Check if we should reuse persistent session (API mode only)
+	from qa_agent.utils.session_registry import get_persistent_session, get_persistent_session_id
+	from qa_agent.utils.settings_manager import get_settings_manager
+	
+	settings_manager = get_settings_manager()
+	browser_config = settings_manager.get_browser_config_raw()
+	connection_type = browser_config.get("connection_type", "localhost")
+	
+	session_id = None
+	session = None
+	
+	# Only check for persistent session in API mode (localhost mode connects to existing browser)
+	if connection_type == "api":
+		persistent_session = get_persistent_session()
+		persistent_session_id = get_persistent_session_id()
+		
+		if persistent_session and persistent_session_id:
+			# Verify session is still valid by checking CDP connection
+			try:
+				# Try to get browser state to verify session is still connected
+				await persistent_session.get_browser_state_summary(include_screenshot=False)
+				logger.info(f"INIT: Reusing persistent browser session: {persistent_session_id[:16]}...")
+				logger.info("INIT: This preserves cookies, login state, and browser data from Live Preview")
+				session_id = persistent_session_id
+				session = persistent_session
+				
+				# Navigate to start_url if provided and different from current URL
+				if start_url:
+					try:
+						current_url = await session.get_current_page_url()
+						if current_url != start_url:
+							logger.info(f"INIT: Navigating persistent session from {current_url} to {start_url}")
+							await session.navigate_to(start_url)
+							logger.info(f"INIT: Successfully navigated to: {start_url}")
+						else:
+							logger.info(f"INIT: Persistent session already at {start_url}, no navigation needed")
+					except Exception as e:
+						logger.warning(f"INIT: Could not get current URL or navigate persistent session: {e}")
+						logger.info(f"INIT: Attempting navigation to {start_url} anyway...")
+						try:
+							await session.navigate_to(start_url)
+							logger.info(f"INIT: Successfully navigated to: {start_url}")
+						except Exception as nav_error:
+							logger.error(f"INIT: Failed to navigate persistent session: {nav_error}")
+							# Continue anyway - session is still valid
+			except Exception as e:
+				logger.warning(f"INIT: Persistent session {persistent_session_id[:16]}... is no longer valid: {e}")
+				logger.info("INIT: Creating new browser session instead")
+				from qa_agent.utils.session_registry import clear_persistent_session
+				clear_persistent_session()
+				# Fall through to create new session
+		else:
+			logger.info("INIT: No persistent session available, creating new browser session")
+	
+	# Create new browser session if not reusing persistent one
+	if session_id is None or session is None:
+		# Create browser session (this connects to kernel-image CDP or creates new API session)
+		logger.info(f"INIT: Creating browser session{' with start_url=' + start_url if start_url else ''}")
+		result = await create_browser_session(start_url=start_url)
+		# Handle both old format (2 values) and new format (3 values) for backward compatibility
+		if len(result) == 3:
+			session_id, session, browser_live_view_url = result
+		else:
+			session_id, session = result
+			browser_live_view_url = None
 
-	logger.info(f"INIT: Browser session created successfully: {session_id}")
+		logger.info(f"INIT: Browser session created successfully: {session_id}")
+		
+		# In API mode, mark this new session as persistent and store browser URL
+		if connection_type == "api":
+			from qa_agent.utils.session_registry import set_persistent_session
+			set_persistent_session(session_id)
+			logger.info(f"INIT: Marked new session {session_id[:16]}... as persistent for API mode")
+			
+			# Store browser_live_view_url in session if available
+			if browser_live_view_url:
+				setattr(session, '_browser_live_view_url', browser_live_view_url)
+				logger.info(f"INIT: Stored browser live view URL: {browser_live_view_url}")
+			else:
+				logger.warning("INIT: No browser_live_view_url in API mode - browser view may not work")
 
-	# Get current URL after navigation
+	# Get current URL after navigation (or from persistent session)
 	current_url = None
-	if start_url:
-		try:
-			current_url = await session.get_current_page_url()
-			logger.info(f"INIT: Navigated to {current_url}")
-		except Exception as e:
-			logger.warning(f"INIT: Could not get current page URL: {e}")
-			current_url = start_url  # Fallback to requested URL
+	try:
+		current_url = await session.get_current_page_url()
+		if start_url:
+			logger.info(f"INIT: Current page URL: {current_url}")
+		else:
+			logger.info(f"INIT: Browser session ready at: {current_url}")
+	except Exception as e:
+		logger.warning(f"INIT: Could not get current page URL: {e}")
+		current_url = start_url if start_url else None  # Fallback to requested URL or None
 
 	# Initialize tab tracking for new tab detection (browser pattern)
 	tab_count = 1  # Start with 1 tab

@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     kernel_cdp_host: str = "localhost"
     kernel_cdp_port: int = 9222
 
+    # OnKernel API Settings (for cloud browser service)
+    kernel_api_key: Optional[str] = None  # OnKernel API key (can be set via KERNEL_API_KEY env var)
+    kernel_api_endpoint: str = "https://api.onkernel.com"  # OnKernel API endpoint (can be overridden)
+
     # Retry Strategy                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
     retry_delay: float = 1.0  # seconds between retries
     retry_backoff: float = 2.0  # exponential backoff multiplier

@@ -106,6 +106,43 @@ async def stream_workflow_updates(websocket: WebSocket, client_id: str, task: st
                 }
             })
 
+            # If INIT node completed, send browser URL for API mode
+            if node_name == "init":
+                browser_session_id = node_data.get("browser_session_id")
+                if browser_session_id:
+                    try:
+                        from qa_agent.utils.session_registry import get_session
+                        from qa_agent.utils.settings_manager import get_settings_manager
+                        
+                        session = get_session(browser_session_id)
+                        if session:
+                            settings_manager = get_settings_manager()
+                            browser_config = settings_manager.get_browser_config_raw()
+                            connection_type = browser_config.get("connection_type", "localhost")
+                            
+                            browser_url = None
+                            if connection_type == "api":
+                                browser_url = getattr(session, '_browser_live_view_url', None)
+                                if browser_url:
+                                    logger.info(f"Sending browser URL to frontend: {browser_url[:50]}...")
+                                    await manager.send_message(client_id, {
+                                        "type": "browser_url",
+                                        "browser_url": browser_url,
+                                        "connection_type": connection_type,
+                                        "session_id": browser_session_id[:16] + "..."
+                                    })
+                                else:
+                                    logger.warning("No browser_live_view_url available in API mode")
+                            elif connection_type == "localhost":
+                                # For localhost, send localhost URL
+                                await manager.send_message(client_id, {
+                                    "type": "browser_url",
+                                    "browser_url": "http://localhost:8080",
+                                    "connection_type": connection_type
+                                })
+                    except Exception as e:
+                        logger.warning(f"Could not send browser URL: {e}", exc_info=True)
+
             # Send browser action if available
             if "action" in node_data and node_data["action"]:
                 await manager.send_message(client_id, {

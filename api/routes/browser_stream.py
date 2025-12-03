@@ -112,28 +112,256 @@ async def init_persistent_browser():
     Returns:
         Session information including session_id and browser_url
     """
+    logger.info("=" * 80)
+    logger.info("=== INIT-PERSISTENT ENDPOINT CALLED ===")
+    logger.info("=" * 80)
     try:
         from qa_agent.utils.browser_manager import create_browser_session
+        from qa_agent.utils.settings_manager import get_settings_manager
+        
+        logger.info("=== Starting persistent browser session initialization ===")
+        
+        # Get browser configuration to determine connection type
+        settings_manager = get_settings_manager()
+        browser_config = settings_manager.get_browser_config_raw()
+        connection_type = browser_config.get("connection_type", "localhost")
+        
+        logger.info(f"Connection type: {connection_type}")
+        logger.info(f"Browser config keys: {list(browser_config.keys())}")
+        logger.info(f"API key present: {bool(browser_config.get('api_key'))}")
+        logger.info(f"API endpoint: {browser_config.get('api_endpoint', 'not set')}")
+        if browser_config.get('api_key'):
+            masked_key = browser_config['api_key'][:4] + "..." + browser_config['api_key'][-4:] if len(browser_config['api_key']) > 8 else "***"
+            logger.info(f"API key (masked): {masked_key}")
         
         # Create a persistent browser session (no start_url - just initialize)
-        session_id, session = await create_browser_session(start_url=None)
+        # Returns: (session_id, session, browser_live_view_url)
+        logger.info("Calling create_browser_session()...")
+        try:
+            result = await create_browser_session(start_url=None)
+            logger.info(f"create_browser_session() returned, result type: {type(result)}, length: {len(result) if hasattr(result, '__len__') else 'N/A'}")
+        except Exception as create_error:
+            logger.error(f"create_browser_session() raised exception: {create_error}", exc_info=True)
+            raise  # Re-raise to be caught by outer try/except
+        
+        # Handle both old format (2 values) and new format (3 values)
+        if isinstance(result, tuple) and len(result) == 3:
+            session_id, session, browser_live_view_url = result
+            logger.info(f"Got 3-value return: session_id={session_id[:16]}..., browser_live_view_url={browser_live_view_url}")
+        elif isinstance(result, tuple) and len(result) == 2:
+            session_id, session = result
+            browser_live_view_url = None
+            logger.info(f"Got 2-value return: session_id={session_id[:16]}..., browser_live_view_url=None")
+        else:
+            logger.error(f"Unexpected return format from create_browser_session: {result}")
+            raise ValueError(f"Unexpected return format from create_browser_session: {type(result)}")
         
         logger.info(f"Persistent browser session initialized: {session_id[:16]}...")
+        
+        # Mark this session as persistent (for API mode only)
+        # This allows test execution to reuse the same browser instance, preserving cookies/login state
+        if connection_type == "api":
+            from qa_agent.utils.session_registry import set_persistent_session
+            set_persistent_session(session_id)
+            logger.info(f"Marked session {session_id[:16]}... as persistent (will be reused for test execution)")
+        
+        # Determine browser URL based on connection type
+        if connection_type == "api":
+            # For cloud API, use the browser_live_view_url from OnKernel API response
+            if browser_live_view_url:
+                browser_url = browser_live_view_url
+                logger.info(f"Using OnKernel cloud browser live view URL: {browser_url}")
+            else:
+                # Fallback: try to get from session attribute
+                browser_url = getattr(session, '_browser_live_view_url', None)
+                if browser_url:
+                    logger.info(f"Using browser live view URL from session: {browser_url}")
+                else:
+                    logger.warning("No browser_live_view_url available - browser view may not work")
+                    browser_url = None  # Don't provide invalid URL
+        else:
+            browser_url = "http://localhost:8080"
+            logger.info(f"Using localhost browser URL: {browser_url}")
         
         return {
             "success": True,
             "session_id": session_id,
-            "browser_url": "http://localhost:8080",
+            "browser_url": browser_url,
+            "connection_type": connection_type,
             "message": "Persistent browser session initialized"
         }
     except Exception as e:
-        logger.error(f"Error initializing persistent browser session: {e}", exc_info=True)
-        # Return success anyway - the iframe will still work
+        logger.error(f"=== ERROR initializing persistent browser session ===", exc_info=True)
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {str(e)}")
+        logger.error(f"Full traceback:", exc_info=True)
+        
+        # Get connection type for error response
+        try:
+            from qa_agent.utils.settings_manager import get_settings_manager
+            settings_manager = get_settings_manager()
+            browser_config = settings_manager.get_browser_config_raw()
+            connection_type = browser_config.get("connection_type", "localhost")
+        except:
+            connection_type = "unknown"
+        
+        # Return error with details - don't return success=false with localhost URL
+        # This will help frontend understand the issue
         return {
             "success": False,
             "error": str(e),
-            "browser_url": "http://localhost:8080",
-            "message": "Browser view available but session initialization failed"
+            "error_type": type(e).__name__,
+            "connection_type": connection_type,
+            "browser_url": None,  # Don't provide a URL if initialization failed
+            "message": f"Browser session initialization failed: {str(e)}"
+        }
+
+
+@router.get("/browser/persistent-url")
+async def get_persistent_browser_url():
+    """
+    Get the browser live view URL from the persistent session (if available).
+    
+    This endpoint is used by the frontend to get the correct browser URL for test execution.
+    In API mode, it returns the cloud browser URL from the persistent session.
+    In localhost mode, it returns the localhost URL.
+    
+    Returns:
+        Browser URL for the persistent session, or localhost fallback
+    """
+    try:
+        from qa_agent.utils.session_registry import get_persistent_session, get_persistent_session_id
+        from qa_agent.utils.settings_manager import get_settings_manager
+        
+        settings_manager = get_settings_manager()
+        browser_config = settings_manager.get_browser_config_raw()
+        connection_type = browser_config.get("connection_type", "localhost")
+        
+        logger.info(f"Getting persistent browser URL for connection type: {connection_type}")
+        
+        if connection_type == "api":
+            persistent_session = get_persistent_session()
+            persistent_session_id = get_persistent_session_id()
+            
+            if persistent_session and persistent_session_id:
+                browser_live_view_url = getattr(persistent_session, '_browser_live_view_url', None)
+                if browser_live_view_url:
+                    logger.info(f"Found persistent session browser URL: {browser_live_view_url[:50]}...")
+                    return {
+                        "success": True,
+                        "browser_url": browser_live_view_url,
+                        "connection_type": connection_type,
+                        "session_id": persistent_session_id[:16] + "..."
+                    }
+                else:
+                    logger.warning(f"Persistent session {persistent_session_id[:16]}... exists but no browser_live_view_url")
+            
+            # In API mode, if no persistent session, return None (don't fallback to localhost)
+            logger.warning("No persistent session available in API mode - browser session will be created by workflow")
+            return {
+                "success": False,
+                "browser_url": None,  # Don't provide localhost fallback in API mode
+                "connection_type": connection_type,
+                "message": "No persistent session available. Browser session will be created when workflow starts."
+            }
+        
+        # Only fallback to localhost for localhost mode
+        if connection_type == "localhost":
+            browser_url = "http://localhost:8080"
+            logger.info(f"Using localhost browser URL: {browser_url}")
+            return {
+                "success": True,
+                "browser_url": browser_url,
+                "connection_type": connection_type
+            }
+        
+        # Should not reach here, but just in case
+        logger.error(f"Unknown connection type: {connection_type}")
+        return {
+            "success": False,
+            "browser_url": None,
+            "connection_type": connection_type,
+            "error": f"Unknown connection type: {connection_type}"
+        }
+    except Exception as e:
+        logger.error(f"Error getting persistent browser URL: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "browser_url": "http://localhost:8080",  # Safe fallback
+            "connection_type": "unknown"
+        }
+
+
+@router.post("/browser/test-api-connection")
+async def test_onkernel_api_connection():
+    """
+    Test OnKernel API connection - useful for debugging
+    
+    Returns:
+        Test results including API response
+    """
+    try:
+        from qa_agent.utils.settings_manager import get_settings_manager
+        from qa_agent.browser.onkernel_api import OnKernelAPIClient, OnKernelAPIError, OnKernelAPIAuthError
+        
+        settings_manager = get_settings_manager()
+        browser_config = settings_manager.get_browser_config_raw()
+        connection_type = browser_config.get("connection_type", "localhost")
+        
+        if connection_type != "api":
+            return {
+                "success": False,
+                "error": "Connection type is not 'api'. Current type: " + connection_type,
+                "connection_type": connection_type
+            }
+        
+        api_key = browser_config.get("api_key")
+        api_endpoint = browser_config.get("api_endpoint", "https://api.onkernel.com")
+        
+        if not api_key:
+            return {
+                "success": False,
+                "error": "API key is not configured",
+                "connection_type": connection_type
+            }
+        
+        try:
+            client = OnKernelAPIClient(api_key=api_key, api_endpoint=api_endpoint)
+            session_data = await client.create_browser_session(headless=False)
+            
+            return {
+                "success": True,
+                "connection_type": connection_type,
+                "api_endpoint": api_endpoint,
+                "session_data": {
+                    "cdp_ws_url": session_data.get("cdp_ws_url", "Not found"),
+                    "browser_live_view_url": session_data.get("browser_live_view_url", "Not found"),
+                    "session_id": session_data.get("session_id", "Not found"),
+                    "raw_response_keys": list(session_data.get("raw_response", {}).keys()) if session_data.get("raw_response") else []
+                },
+                "message": "API connection successful"
+            }
+        except OnKernelAPIAuthError as e:
+            return {
+                "success": False,
+                "error": f"Authentication failed: {str(e)}",
+                "connection_type": connection_type,
+                "api_endpoint": api_endpoint
+            }
+        except OnKernelAPIError as e:
+            return {
+                "success": False,
+                "error": f"API error: {str(e)}",
+                "connection_type": connection_type,
+                "api_endpoint": api_endpoint
+            }
+    except Exception as e:
+        logger.error(f"Error testing API connection: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__
         }
 
 

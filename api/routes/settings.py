@@ -67,6 +67,34 @@ class AvailableModelsResponse(BaseModel):
     models: List[str]
 
 
+class BrowserSettingsRequest(BaseModel):
+    """Request model for updating browser settings"""
+    connection_type: Optional[str] = Field(None, description="Connection type: 'localhost' or 'api'")
+    kernel_cdp_host: Optional[str] = Field(None, description="Host for localhost mode")
+    kernel_cdp_port: Optional[int] = Field(None, ge=1, le=65535, description="Port for localhost mode (1-65535)")
+    api_key: Optional[str] = Field(None, description="OnKernel API key (required for API mode)")
+    api_endpoint: Optional[str] = Field(None, description="OnKernel API endpoint URL")
+    
+    @field_validator('connection_type')
+    @classmethod
+    def validate_connection_type(cls, v):
+        if v is not None:
+            v_lower = v.lower()
+            if v_lower not in ["localhost", "api"]:
+                raise ValueError("connection_type must be 'localhost' or 'api'")
+            return v_lower
+        return v
+
+
+class BrowserSettingsResponse(BaseModel):
+    """Response model for browser settings"""
+    connection_type: str
+    kernel_cdp_host: str
+    kernel_cdp_port: int
+    api_key: Optional[str] = None  # Masked in response
+    api_endpoint: str
+
+
 @router.get("/settings", response_model=SettingsResponse)
 async def get_all_settings():
     """
@@ -253,5 +281,73 @@ async def get_available_models(provider: str = Query(..., description="LLM provi
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error getting available models: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/settings/browser", response_model=BrowserSettingsResponse)
+async def get_browser_settings():
+    """
+    Get current browser settings
+    
+    Returns:
+        Current browser configuration
+    """
+    try:
+        manager = get_settings_manager()
+        browser_config = manager.get_browser_config()
+        
+        return BrowserSettingsResponse(
+            connection_type=browser_config.get("connection_type", "localhost"),
+            kernel_cdp_host=browser_config.get("kernel_cdp_host", "localhost"),
+            kernel_cdp_port=browser_config.get("kernel_cdp_port", 9222),
+            api_key=browser_config.get("api_key"),  # Already masked in get_browser_config()
+            api_endpoint=browser_config.get("api_endpoint", "https://api.onkernel.com"),
+        )
+    except Exception as e:
+        logger.error(f"Error getting browser settings: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/settings/browser", response_model=BrowserSettingsResponse)
+async def update_browser_settings(request: BrowserSettingsRequest):
+    """
+    Update browser settings
+    
+    Args:
+        request: Browser settings to update
+        
+    Returns:
+        Updated browser settings
+    """
+    try:
+        manager = get_settings_manager()
+        
+        # Validate API key requirement for API mode
+        if request.connection_type == "api":
+            # Check if API key is provided or already exists
+            current_config = manager.get_browser_config_raw()
+            if not request.api_key and not current_config.get("api_key"):
+                raise ValueError("API key is required when using API connection type")
+        
+        updated = manager.update_browser_settings(
+            connection_type=request.connection_type,
+            kernel_cdp_host=request.kernel_cdp_host,
+            kernel_cdp_port=request.kernel_cdp_port,
+            api_key=request.api_key,
+            api_endpoint=request.api_endpoint,
+        )
+        
+        return BrowserSettingsResponse(
+            connection_type=updated.get("connection_type", "localhost"),
+            kernel_cdp_host=updated.get("kernel_cdp_host", "localhost"),
+            kernel_cdp_port=updated.get("kernel_cdp_port", 9222),
+            api_key=updated.get("api_key"),  # Masked
+            api_endpoint=updated.get("api_endpoint", "https://api.onkernel.com"),
+        )
+    except ValueError as e:
+        logger.warning(f"Invalid browser settings update: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error updating browser settings: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
