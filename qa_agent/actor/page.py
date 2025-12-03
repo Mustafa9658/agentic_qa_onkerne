@@ -455,8 +455,19 @@ Before you return the element index, reason about the state and elements for a s
 			# thinking: str
 			element_highlight_index: int | None
 
-		# LangChain uses with_structured_output() method
-		structured_llm = llm.with_structured_output(ElementResponse)
+		# Use provider-specific structured output method
+		from qa_agent.llm import get_structured_output_method
+		from qa_agent.utils.settings_manager import get_settings_manager
+		settings_manager = get_settings_manager()
+		llm_config = settings_manager.get_llm_config()
+		provider = llm_config.get("provider", "openai").lower()
+		method = get_structured_output_method(provider)
+		
+		if method:
+			structured_llm = llm.with_structured_output(ElementResponse, method=method)
+		else:
+			structured_llm = llm.with_structured_output(ElementResponse)
+		
 		llm_response = await structured_llm.ainvoke(
 			[
 				system_message,
@@ -539,8 +550,19 @@ You will be given a query and the markdown of a webpage that has been filtered t
 		import asyncio
 
 		try:
-			# LangChain uses with_structured_output() method
-			structured_llm = llm.with_structured_output(structured_output)
+			# Use provider-specific structured output method
+			from qa_agent.llm import get_structured_output_method
+			from qa_agent.utils.settings_manager import get_settings_manager
+			settings_manager = get_settings_manager()
+			llm_config = settings_manager.get_llm_config()
+			provider = llm_config.get("provider", "openai").lower()
+			method = get_structured_output_method(provider)
+			
+			if method:
+				structured_llm = llm.with_structured_output(structured_output, method=method)
+			else:
+				structured_llm = llm.with_structured_output(structured_output)
+			
 			response = await asyncio.wait_for(
 				structured_llm.ainvoke(
 					[SystemMessage(content=system_prompt), UserMessage(content=prompt_content)]

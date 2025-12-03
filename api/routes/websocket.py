@@ -211,6 +211,70 @@ async def websocket_automation_endpoint(
         manager.disconnect(client_id)
 
 
+@router.websocket("/ws")
+async def simple_websocket_endpoint(websocket: WebSocket):
+    """
+    Simple WebSocket endpoint for general real-time updates.
+    
+    This endpoint accepts connections without requiring query parameters.
+    Used by the frontend for general notifications and test updates.
+    
+    Usage:
+        ws://localhost:8000/api/v1/ws
+    """
+    import uuid
+    client_id = str(uuid.uuid4())[:8]
+    
+    await manager.connect(websocket, client_id)
+    
+    try:
+        # Send initial connection message
+        await websocket.send_json({
+            "type": "connected",
+            "message": "WebSocket connected",
+            "client_id": client_id
+        })
+        
+        # Keep connection alive and listen for client messages
+        while True:
+            try:
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                
+                # Handle ping/pong for keepalive
+                if message.get("type") == "ping":
+                    await manager.send_message(client_id, {"type": "pong"})
+                
+                # Handle subscribe to test
+                elif message.get("type") == "subscribe_test":
+                    test_id = message.get("test_id")
+                    await manager.send_message(client_id, {
+                        "type": "subscribed",
+                        "test_id": test_id,
+                        "message": f"Subscribed to test {test_id}"
+                    })
+                
+                # Handle disconnect request
+                elif message.get("type") == "disconnect":
+                    break
+                    
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"Error in WebSocket for client {client_id}: {e}")
+                await manager.send_message(client_id, {
+                    "type": "error",
+                    "message": str(e)
+                })
+    
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket client {client_id} disconnected normally")
+    except Exception as e:
+        logger.error(f"WebSocket error for client {client_id}: {e}")
+    finally:
+        manager.disconnect(client_id)
+
+
 @router.get("/ws/status")
 async def websocket_status():
     """Get WebSocket server status"""

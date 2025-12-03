@@ -364,8 +364,20 @@ async def report_node(state: QAAgentState) -> Dict[str, Any]:
 				judge_llm = get_llm()  # TODO: Consider separate judge_llm config
 				logger.info(f"  Calling judge LLM: {judge_llm.model_name if hasattr(judge_llm, 'model_name') else 'unknown'}")
 
-				# Use LangChain structured output pattern
-				structured_judge_llm = judge_llm.with_structured_output(JudgementResult)
+				# Use provider-specific structured output method
+				from qa_agent.llm import get_structured_output_method
+				settings_manager = get_settings_manager()
+				llm_config = settings_manager.get_llm_config()
+				provider = llm_config.get("provider", "openai").lower()
+				method = get_structured_output_method(provider)
+				
+				# Create structured LLM with provider-appropriate method
+				if method:
+					logger.info(f"  Using structured output method '{method}' for provider '{provider}'")
+					structured_judge_llm = judge_llm.with_structured_output(JudgementResult, method=method)
+				else:
+					logger.info(f"  Using default structured output method for provider '{provider}'")
+					structured_judge_llm = judge_llm.with_structured_output(JudgementResult)
 
 				# Convert browser messages to LangChain format
 				from langchain_core.messages import SystemMessage as LCSystemMessage, HumanMessage
@@ -391,7 +403,12 @@ async def report_node(state: QAAgentState) -> Dict[str, Any]:
 						else:
 							lc_messages.append(HumanMessage(content=msg.content))
 
-				judgement: JudgementResult = await structured_judge_llm.ainvoke(lc_messages)
+				# Add timeout protection to prevent hanging (especially important for Gemini)
+				import asyncio
+				judgement: JudgementResult = await asyncio.wait_for(
+					structured_judge_llm.ainvoke(lc_messages),
+					timeout=120.0  # 120 second timeout for judge evaluation
+				)
 
 				# Add judgement to report
 				report["judgement"] = {

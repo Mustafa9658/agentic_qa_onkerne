@@ -95,7 +95,22 @@ Create a title, goal statement, and break down the task into logical steps. Retu
         
         # Call LLM with structured output (with timeout to prevent hanging)
         logger.info(f"llm_create_todo_structure: Creating structured LLM with TodoStructureResponse")
-        structured_llm = llm.with_structured_output(TodoStructureResponse)
+        
+        # Use provider-specific structured output method
+        from qa_agent.llm import get_structured_output_method
+        from qa_agent.utils.settings_manager import get_settings_manager
+        settings_manager = get_settings_manager()
+        llm_config = settings_manager.get_llm_config()
+        provider = llm_config.get("provider", "openai").lower()
+        method = get_structured_output_method(provider)
+        
+        if method:
+            logger.info(f"llm_create_todo_structure: Using method '{method}' for provider '{provider}'")
+            structured_llm = llm.with_structured_output(TodoStructureResponse, method=method)
+        else:
+            logger.info(f"llm_create_todo_structure: Using default method for provider '{provider}'")
+            structured_llm = llm.with_structured_output(TodoStructureResponse)
+        
         logger.info(f"llm_create_todo_structure: Structured LLM created, calling ainvoke with 60s timeout...")
         
         import asyncio

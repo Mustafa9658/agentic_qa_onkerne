@@ -101,6 +101,42 @@ async def browser_stream_websocket(
         stream_manager.disconnect(client_id)
 
 
+@router.post("/browser/init-persistent")
+async def init_persistent_browser():
+    """
+    Initialize a persistent browser session for the frontend browser view.
+    
+    This endpoint creates a browser session that stays alive for the browser view iframe.
+    The session is managed by the session registry and can be reused across test executions.
+    
+    Returns:
+        Session information including session_id and browser_url
+    """
+    try:
+        from qa_agent.utils.browser_manager import create_browser_session
+        
+        # Create a persistent browser session (no start_url - just initialize)
+        session_id, session = await create_browser_session(start_url=None)
+        
+        logger.info(f"Persistent browser session initialized: {session_id[:16]}...")
+        
+        return {
+            "success": True,
+            "session_id": session_id,
+            "browser_url": "http://localhost:8080",
+            "message": "Persistent browser session initialized"
+        }
+    except Exception as e:
+        logger.error(f"Error initializing persistent browser session: {e}", exc_info=True)
+        # Return success anyway - the iframe will still work
+        return {
+            "success": False,
+            "error": str(e),
+            "browser_url": "http://localhost:8080",
+            "message": "Browser view available but session initialization failed"
+        }
+
+
 @router.get("/browser/status")
 async def browser_status():
     """Get browser stream status"""

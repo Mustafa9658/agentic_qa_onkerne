@@ -12,6 +12,7 @@ import json
 import re
 from typing import Optional, Dict, Any, List
 from qa_agent.config import settings
+from qa_agent.utils.settings_manager import get_settings_manager
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,10 @@ class GeminiFallbackAdvisor:
             api_key: Gemini API key (defaults to settings.gemini_api_key)
         """
         self.api_key = api_key or settings.gemini_api_key
-        self.model_name = settings.gemini_computer_use_model
+        # Get model from runtime settings manager (allows dynamic updates)
+        settings_manager = get_settings_manager()
+        fallback_config = settings_manager.get_fallback_config()
+        self.model_name = fallback_config.get("gemini_computer_use_model", settings.gemini_computer_use_model)
         
         if not self.api_key:
             raise ValueError(

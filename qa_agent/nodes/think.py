@@ -16,6 +16,7 @@ from typing import Dict, Any
 from qa_agent.state import QAAgentState
 from qa_agent.config import settings
 from qa_agent.llm import get_llm
+from qa_agent.utils.settings_manager import get_settings_manager
 from qa_agent.prompts.browser_use_prompts import SystemPrompt, AgentMessagePrompt
 
 logger = logging.getLogger(__name__)
@@ -503,16 +504,21 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         fallback_advice = None
         
         if settings.enable_gemini_fallback:
+            # Get fallback trigger thresholds from runtime settings manager
+            from qa_agent.utils.settings_manager import get_settings_manager
+            settings_manager = get_settings_manager()
+            fallback_config = settings_manager.get_fallback_config()
+            
             # Check stuck conditions using state values (from previous step)
             action_repetition = state.get("action_repetition_count", 0)
             consecutive_failures = state.get("consecutive_failures", 0)
             previous_url = state.get("previous_url")
             
-            # Trigger conditions (using state values - will be updated after this step)
+            # Trigger conditions (using runtime settings - will be updated after this step)
             should_use_fallback = (
-                action_repetition >= settings.fallback_trigger_repetition or
-                consecutive_failures >= settings.fallback_trigger_failures or
-                (step_count >= settings.fallback_trigger_same_page_steps and 
+                action_repetition >= fallback_config["fallback_trigger_repetition"] or
+                consecutive_failures >= fallback_config["fallback_trigger_failures"] or
+                (step_count >= fallback_config["fallback_trigger_same_page_steps"] and 
                  current_url == previous_url and previous_url is not None)
             )
             
@@ -907,6 +913,14 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         logger.info("Calling LLM to generate action plan with browser prompts...")
         llm = get_llm()
 
+        # Get runtime LLM configuration for logging
+        from qa_agent.llm import get_structured_output_method
+        settings_manager = get_settings_manager()
+        llm_config = settings_manager.get_llm_config()
+        provider = llm_config.get("provider", "openai").lower()
+        actual_model = llm_config.get("model", settings.llm_model)  # Use runtime model, fallback to config
+        method = get_structured_output_method(provider)
+
         # Convert browser messages to LangChain format
         from langchain_core.messages import SystemMessage as LCSystemMessage, HumanMessage
         langchain_messages = [
@@ -924,12 +938,20 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
         # Create dynamic AgentOutput with the action model
         dynamic_agent_output = AgentOutput.type_with_custom_actions(action_model)
 
-        print(f"\n🤖 Calling LLM ({settings.llm_model}) with structured output...")
+        print(f"\n🤖 Calling LLM ({actual_model}) with structured output...")
         logger.info(f"Using dynamic ActionModel with {len([a for a in tools.registry.registry.actions.keys()])} registered actions")
 
         # LangChain uses with_structured_output() method, NOT output_format parameter
-        # Use function_calling method for OpenAI compatibility with complex nested schemas
-        structured_llm = llm.with_structured_output(dynamic_agent_output, method="function_calling")
+        # Use provider-specific structured output method (centralized helper function)
+        
+        # Create structured LLM with provider-appropriate method
+        if method:
+            logger.info(f"Using structured output method '{method}' for provider '{provider}'")
+            structured_llm = llm.with_structured_output(dynamic_agent_output, method=method)
+        else:
+            logger.info(f"Using default structured output method for provider '{provider}'")
+            structured_llm = llm.with_structured_output(dynamic_agent_output)
+        
         raw_response = await structured_llm.ainvoke(langchain_messages)
         
         # browser pattern: Manually validate the response to match schema (chat_browser_use.py:178)
@@ -955,10 +977,10 @@ async def think_node(state: QAAgentState) -> Dict[str, Any]:
 
         logger.info(f"LLM response received and validated: {parsed}")
 
-        # Save LLM response
+        # Save LLM response (use actual runtime model name)
         log_data["llm_response"] = {
             "parsed_model": parsed.model_dump(),
-            "model": settings.llm_model,
+            "model": actual_model,  # Use runtime model instead of static config
         }
 
         print(f"\n{'='*80}")

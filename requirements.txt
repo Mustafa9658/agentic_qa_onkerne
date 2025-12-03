@@ -12,8 +12,14 @@ langchain-core>=1.0.0
 langgraph>=1.0.0
 langchain-openai>=0.2.0
 langchain-anthropic>=0.2.0
+langchain-google-genai>=3.0.0
 
 # Gemini API
+# NOTE: There's a known dependency conflict between google-generativeai and langchain-google-genai:
+# - google-generativeai 0.8.5 requires google-ai-generativelanguage==0.6.15
+# - langchain-google-genai 3.2.0 requires google-ai-generativelanguage>=0.9.0
+# The fallback advisor uses google-generativeai directly, while main LLM uses langchain-google-genai.
+# Both should work despite the warning, as they use different code paths.
 google-generativeai>=0.8.0
 
 # browser dependencies

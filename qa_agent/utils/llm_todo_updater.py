@@ -140,7 +140,22 @@ Return the zero-based indices of steps that should be marked as complete. Be PRO
     try:
         # Call LLM with structured output (with timeout to prevent hanging)
         import asyncio
-        structured_llm = llm.with_structured_output(TodoUpdateResponse)
+        from qa_agent.llm import get_structured_output_method
+        from qa_agent.utils.settings_manager import get_settings_manager
+        
+        # Use provider-specific structured output method
+        settings_manager = get_settings_manager()
+        llm_config = settings_manager.get_llm_config()
+        provider = llm_config.get("provider", "openai").lower()
+        method = get_structured_output_method(provider)
+        
+        if method:
+            logger.info(f"llm_match_actions_to_todo_steps: Using method '{method}' for provider '{provider}'")
+            structured_llm = llm.with_structured_output(TodoUpdateResponse, method=method)
+        else:
+            logger.info(f"llm_match_actions_to_todo_steps: Using default method for provider '{provider}'")
+            structured_llm = llm.with_structured_output(TodoUpdateResponse)
+        
         response = await asyncio.wait_for(
             structured_llm.ainvoke([
                 SystemMessage(content=system_prompt),
